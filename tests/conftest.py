@@ -50,7 +50,8 @@ class FakeClock:
 @pytest.fixture
 def sessions():
     # Defaults to in-memory SQLite. CI (and `make test-mysql`) point this at real MySQL.
-    sm = make_sessionmaker(os.getenv("CANARY_TEST_DATABASE_URL", "sqlite://"))
+    # `or`, not a getenv default: CI sets the variable to "" for the SQLite job.
+    sm = make_sessionmaker(os.getenv("CANARY_TEST_DATABASE_URL") or "sqlite://")
     drop_db(sm)
     init_db(sm)
     yield sm
