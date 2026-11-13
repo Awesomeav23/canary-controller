@@ -1,0 +1,49 @@
+# One Service in front of two Deployments. The controller moves traffic by changing
+# replica counts; the container must be named "app" (see src/canary/router.py).
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+spec:
+  selector: { app: demo }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-stable
+spec:
+  replicas: 4
+  selector: { matchLabels: { app: demo, track: stable } }
+  template:
+    metadata:
+      labels: { app: demo, track: stable }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "8080" }
+    spec:
+      containers:
+        - name: app
+          image: demo-app:v1
+          imagePullPolicy: IfNotPresent
+          env: [{ name: TRACK, value: stable }]
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 2 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-canary
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: demo, track: canary } }
+  template:
+    metadata:
+      labels: { app: demo, track: canary }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "8080" }
+    spec:
+      containers:
+        - name: app
+          image: demo-app:v1
+          imagePullPolicy: IfNotPresent
+          env: [{ name: TRACK, value: canary }]
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 2 }

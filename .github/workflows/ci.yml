@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e '.[dev]'
+      - run: ruff check . && ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        db: [sqlite, mysql]
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: canary_test
+          MYSQL_USER: canary
+          MYSQL_PASSWORD: canary
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=3s --health-retries=30
+    env:
+      CANARY_TEST_DATABASE_URL: ${{ matrix.db == 'mysql' && 'mysql+pymysql://canary:canary@127.0.0.1:3306/canary_test' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e '.[dev]'
+      - run: pytest -q
+
+  demo-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t demo-app:ci demo-app

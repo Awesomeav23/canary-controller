@@ -1,0 +1,16 @@
+# Steady ~20 req/s against the demo Service so the canary has metrics to judge.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loadgen } }
+  template:
+    metadata:
+      labels: { app: loadgen }
+    spec:
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "while true; do curl -s -o /dev/null http://demo/; sleep 0.05; done"]

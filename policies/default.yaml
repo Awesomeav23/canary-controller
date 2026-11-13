@@ -1,0 +1,12 @@
+# Default rollout policy, used when POST /rollouts has no "policy".
+total_replicas: 4            # stable + canary replicas combined
+analysis_window_seconds: 60  # PromQL rate() window
+
+steps:                       # weight = % of replicas on the canary
+  - { weight: 25, pause_seconds: 60 }
+  - { weight: 50, pause_seconds: 60 }
+  - { weight: 100, pause_seconds: 60 }
+
+thresholds:                  # canary must stay at or under every max, or it rolls back
+  - { metric: error_rate, max: 0.05 }
+  - { metric: p95_latency_ms, max: 500 }
