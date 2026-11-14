@@ -13,6 +13,10 @@ class Settings:
     namespace: str = "default"
     tick_seconds: float = 5.0
     default_policy_path: str = field(default=str(REPO_ROOT / "policies" / "default.yaml"))
+    # When set, POST/PUT/DELETE need "Authorization: Bearer <token>". Reads stay open.
+    api_token: str = ""
+    slack_webhook_url: str = ""
+    webhook_urls: tuple[str, ...] = ()  # generic JSON webhooks
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -24,4 +28,12 @@ class Settings:
             namespace=os.getenv("CANARY_NAMESPACE", d.namespace),
             tick_seconds=float(os.getenv("CANARY_TICK_SECONDS", d.tick_seconds)),
             default_policy_path=os.getenv("CANARY_DEFAULT_POLICY", d.default_policy_path),
+            api_token=os.getenv("CANARY_API_TOKEN", ""),
+            slack_webhook_url=os.getenv("CANARY_SLACK_WEBHOOK_URL", ""),
+            webhook_urls=tuple(
+                u.strip() for u in os.getenv("CANARY_WEBHOOK_URLS", "").split(",") if u.strip()
+            ),
         )
+
+    def __repr__(self) -> str:  # never log secrets (tokens, webhook URLs)
+        return f"Settings(router={self.router!r}, namespace={self.namespace!r}, ...)"

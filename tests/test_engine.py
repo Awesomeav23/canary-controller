@@ -2,6 +2,7 @@ import pytest
 
 from canary.engine import Engine, RolloutBusyError, RolloutFinishedError
 from canary.models import DeployFreeze, Rollout, RolloutState
+from canary.policy import Step
 
 
 def create(sessions, policy, app="demo", image="demo:v2") -> int:
@@ -350,3 +351,18 @@ def test_restart_while_waiting_for_pods(sessions, router, metrics, clock, policy
     r = get(sessions, rid)
     assert r.traffic_shifted_at == clock.now
     assert router.calls.count(("set_weight", "demo", "demo:v2", 25, 4)) == 2  # retried
+
+
+def test_baseline_captured_before_first_traffic_shift(engine, sessions, metrics, clock, policy):
+    """Found on kind: a one-step 100% policy never saw stable traffic, so it could never
+    pass a max_over_stable check. Stable is now snapshotted before step 0."""
+    one_step = policy.model_copy(update={"steps": [Step(weight=100, pause_seconds=20)]})
+    metrics.stable["p95_latency_ms"] = 80
+    rid = create(sessions, one_step)
+    engine.tick()
+    assert get(sessions, rid).baseline["p95_latency_ms"] == 80
+
+    metrics.readings["stable"] = {"request_count": 0}  # 100% on canary now
+    clock.advance(20)
+    engine.tick()
+    assert get(sessions, rid).state == RolloutState.SUCCEEDED

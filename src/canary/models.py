@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, MetaData, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, MetaData, String, Text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -108,3 +108,30 @@ class DeployFreeze(Base):
     app: Mapped[str] = mapped_column(String(63), primary_key=True)
     reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(Timestamp, default=utcnow)
+
+
+class NotificationStatus(StrEnum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"  # gave up after max attempts, or the sink is no longer configured
+
+
+class Notification(Base):
+    """Transactional outbox: one row per (event, sink), written in the same transaction
+    as the state change it describes, then delivered with retries by notify.Dispatcher.
+    A crash can't lose a notification, and a sink outage can't block a rollout."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (Index("ix_notifications_due", "status", "next_attempt_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)  # also the delivery id receivers dedupe on
+    rollout_id: Mapped[int] = mapped_column(ForeignKey("rollouts.id"), index=True)
+    event: Mapped[str] = mapped_column(String(20))  # started | succeeded | rolled_back | aborted
+    sink: Mapped[str] = mapped_column(String(40))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(10), default=NotificationStatus.PENDING)
+    attempts: Mapped[int] = mapped_column(default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(Timestamp)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(Timestamp)
+    sent_at: Mapped[datetime | None] = mapped_column(Timestamp)

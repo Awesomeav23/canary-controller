@@ -1,13 +1,14 @@
 """HTTP API. Run with: uvicorn --factory canary.api:create_app"""
 
 import logging
+import secrets
 import threading
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -18,7 +19,8 @@ from canary.config import Settings
 from canary.db import make_sessionmaker, require_schema_current
 from canary.engine import Engine, RolloutBusyError, RolloutFinishedError
 from canary.metrics import MetricsSource, PrometheusMetrics
-from canary.models import DeployFreeze, Rollout, RolloutEvent
+from canary.models import DeployFreeze, Notification, Rollout, RolloutEvent
+from canary.notify import Dispatcher, Sink, SlackSink, WebhookSink
 from canary.policy import Policy, load_policy
 from canary.router import GatewayRouter, LogRouter, ReplicaRouter, TrafficRouter
 
@@ -69,6 +71,18 @@ class RolloutOut(RolloutSummary):
     events: list[EventOut]
 
 
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    event: str
+    sink: str
+    status: str
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    sent_at: datetime | None
+
+
 class FreezeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     app: str
@@ -86,12 +100,27 @@ def build_router(settings: Settings) -> TrafficRouter:
     raise ValueError(f"unknown router {settings.router!r}")
 
 
-def _run_loop(engine: Engine, stop: threading.Event, interval: float) -> None:
+def build_sinks(settings: Settings) -> dict[str, Sink]:
+    sinks: dict[str, Sink] = {}
+    if settings.slack_webhook_url:
+        sinks["slack"] = SlackSink(settings.slack_webhook_url)
+    for i, url in enumerate(settings.webhook_urls, start=1):
+        sinks[f"webhook-{i}"] = WebhookSink(url)
+    return sinks
+
+
+def _run_loop(
+    engine: Engine, dispatcher: Dispatcher, stop: threading.Event, interval: float
+) -> None:
     while not stop.wait(interval):
         try:
             engine.tick()
         except Exception:
             log.exception("tick failed")
+        try:
+            dispatcher.dispatch_due()
+        except Exception:
+            log.exception("notification dispatch failed")
 
 
 def create_app(
@@ -100,16 +129,20 @@ def create_app(
     sessions: sessionmaker | None = None,
     router: TrafficRouter | None = None,
     metrics: MetricsSource | None = None,
+    sinks: dict[str, Sink] | None = None,
     run_loop: bool = True,
 ) -> FastAPI:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = settings or Settings.from_env()
     sessions = sessions or make_sessionmaker(settings.database_url)
+    sinks = build_sinks(settings) if sinks is None else sinks
     engine = Engine(
         sessions,
         router or build_router(settings),
         metrics or PrometheusMetrics(settings.prometheus_url),
+        notify_sinks=sorted(sinks),
     )
+    dispatcher = Dispatcher(sessions, sinks)
     default_policy = load_policy(settings.default_policy_path)
 
     @asynccontextmanager
@@ -120,7 +153,7 @@ def create_app(
         if run_loop:
             thread = threading.Thread(
                 target=_run_loop,
-                args=(engine, stop, settings.tick_seconds),
+                args=(engine, dispatcher, stop, settings.tick_seconds),
                 name="rollout-loop",
                 daemon=True,
             )
@@ -132,6 +165,16 @@ def create_app(
 
     app = FastAPI(title="canary-controller", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
+    app.state.dispatcher = dispatcher
+
+    def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+        if not settings.api_token:
+            return
+        expected = f"Bearer {settings.api_token}"
+        if authorization is None or not secrets.compare_digest(authorization, expected):
+            raise HTTPException(401, "missing or invalid API token")
+
+    Write = [Depends(require_token)]
 
     def get_session() -> Iterator[Session]:
         with sessions() as s:
@@ -153,7 +196,7 @@ def create_app(
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/rollouts", status_code=201)
+    @app.post("/rollouts", status_code=201, dependencies=Write)
     def create_rollout(body: RolloutCreate, s: SessionDep) -> RolloutOut:
         policy = body.policy or default_policy
         rollout = Rollout(
@@ -184,7 +227,7 @@ def create_app(
     def get_rollout(rollout_id: int, s: SessionDep) -> RolloutOut:
         return RolloutOut.model_validate(load(s, rollout_id))
 
-    @app.post("/rollouts/{rollout_id}/abort")
+    @app.post("/rollouts/{rollout_id}/abort", dependencies=Write)
     def abort_rollout(
         rollout_id: int, s: SessionDep, body: AbortRequest | None = None
     ) -> RolloutOut:
@@ -198,17 +241,27 @@ def create_app(
             raise HTTPException(409, f"can't abort: {e}") from None
         return RolloutOut.model_validate(load(s, rollout_id))
 
+    @app.get("/rollouts/{rollout_id}/notifications")
+    def rollout_notifications(rollout_id: int, s: SessionDep) -> list[NotificationOut]:
+        load(s, rollout_id)
+        q = (
+            select(Notification)
+            .where(Notification.rollout_id == rollout_id)
+            .order_by(Notification.id)
+        )
+        return [NotificationOut.model_validate(n) for n in s.scalars(q)]
+
     @app.get("/freezes")
     def list_freezes(s: SessionDep) -> list[FreezeOut]:
         return [FreezeOut.model_validate(f) for f in s.scalars(select(DeployFreeze))]
 
-    @app.put("/freezes/{app_name}")
+    @app.put("/freezes/{app_name}", dependencies=Write)
     def freeze(app_name: AppName, body: FreezeRequest, s: SessionDep) -> FreezeOut:
         f = s.merge(DeployFreeze(app=app_name, reason=body.reason))
         s.commit()
         return FreezeOut.model_validate(f)
 
-    @app.delete("/freezes/{app_name}", status_code=204)
+    @app.delete("/freezes/{app_name}", status_code=204, dependencies=Write)
     def unfreeze(app_name: str, s: SessionDep) -> Response:
         f = s.get(DeployFreeze, app_name)
         if f is None:

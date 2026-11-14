@@ -3,6 +3,7 @@
 Usage: python scripts/watch_rollout.py <image> [app] [api_url] [policy.yaml]
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -52,7 +53,9 @@ def main() -> int:
         with open(sys.argv[4]) as f:
             body["policy"] = yaml.safe_load(f)
 
-    resp = httpx.post(f"{api}/rollouts", json=body)
+    token = os.getenv("CANARY_API_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = httpx.post(f"{api}/rollouts", json=body, headers=headers)
     if resp.status_code != 201:
         print(f"could not start rollout: {resp.status_code} {resp.text}")
         return 1

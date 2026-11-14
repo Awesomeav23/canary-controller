@@ -1,0 +1,58 @@
+# Starts a canary rollout after CI passes on main.
+#
+# Does nothing until it's wired to a reachable controller. To enable, set in the repo:
+#   variables: CANARY_API_URL   e.g. https://canary.internal.example.com
+#              CANARY_APP       e.g. demo
+#              IMAGE_REPO       e.g. ghcr.io/you/demo-app (images tagged with the commit SHA)
+#   secret:    CANARY_API_TOKEN
+# Building and pushing the image is the app's own CI's job; this only rolls it out.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Image to roll out (default IMAGE_REPO:<commit sha>)
+        required: false
+
+concurrency:
+  group: deploy-${{ vars.CANARY_APP }}
+  cancel-in-progress: false # never cancel a rollout in flight; the next one waits
+
+permissions:
+  contents: read
+
+jobs:
+  rollout:
+    if: >-
+      vars.CANARY_API_URL != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: ./.github/actions/canary-rollout
+        id: canary
+        with:
+          api-url: ${{ vars.CANARY_API_URL }}
+          token: ${{ secrets.CANARY_API_TOKEN }}
+          app: ${{ vars.CANARY_APP }}
+          image: ${{ inputs.image || format('{0}:{1}', vars.IMAGE_REPO, github.event.workflow_run.head_sha || github.sha) }}
+          timeout-seconds: "1800"
+
+      - name: Summary
+        if: always()
+        env:
+          STATE: ${{ steps.canary.outputs.state }}
+          REASON: ${{ steps.canary.outputs.reason }}
+          ROLLOUT_ID: ${{ steps.canary.outputs.rollout-id }}
+        run: |
+          echo "### Canary rollout ${ROLLOUT_ID:-?}: ${STATE:-did not start}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$REASON" ]; then echo "> $REASON" >> "$GITHUB_STEP_SUMMARY"; fi

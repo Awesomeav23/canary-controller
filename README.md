@@ -52,6 +52,8 @@ analyse. `promoting` waits for stable to run the new image before traffic moves 
 | `router.py` | Traffic shifting: `GatewayRouter` (route weights) or `ReplicaRouter` (pod ratio) |
 | `api.py` | REST API and the background loop |
 | `telemetry.py` | Prometheus metrics about the controller itself |
+| `notify.py` | Slack/webhook alerts: outbox rows + dispatcher with retries |
+| `cli.py` | `canary-rollout`: start a rollout and wait for it (CI) |
 | `db.py`, `migrations/` | Connections, Alembic migrations, startup schema check |
 
 ## Quickstart (no cluster needed)
@@ -167,9 +169,10 @@ How a step is judged, once its pause is over:
 1. **Enough traffic?** Fewer than `min_requests` canary requests in the window: wait
    (logged once), and roll back if traffic never arrives within
    `max_wait_for_traffic_seconds`.
-2. **Baseline.** If stable also has enough traffic, its readings become the new baseline
-   and are saved on the rollout. If not (at the 100% step stable has no pods), the last
-   saved baseline is used.
+2. **Baseline.** Stable is snapshotted just before step 0 moves any traffic, while it
+   still serves everyone. At later steps, if stable has enough traffic its readings
+   replace the baseline; if not (stable gets no traffic at 100%), the last saved one is
+   used.
 3. **Checks.** Every threshold must pass. Missing data, or no baseline for a
    `max_over_stable` check, counts as a failure.
 
@@ -201,7 +204,92 @@ measure should not be promoted.
 | `POST` | `/rollouts/{id}/abort` | Stop now and roll back |
 | `PUT` / `DELETE` | `/freezes/{app}` | Start or end a deploy freeze (new rollouts wait) |
 | `GET` | `/freezes` | List active freezes |
+| `GET` | `/rollouts/{id}/notifications` | Delivery status of that rollout's Slack/webhook alerts |
 | `GET` | `/metrics` | Prometheus metrics about the controller itself (below) |
+
+Set `CANARY_API_TOKEN` and every `POST`/`PUT`/`DELETE` needs
+`Authorization: Bearer <token>` (compared in constant time). Reads stay open.
+
+## Notifications
+
+```bash
+CANARY_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...   # Slack incoming webhook
+CANARY_WEBHOOK_URLS=https://a.example.com/hook,https://b...      # generic JSON webhooks
+```
+
+Sent when a rollout **starts** (first traffic), **succeeds**, **rolls back** or is
+**aborted**:
+
+```text
+:rotating_light: *demo* `demo-app:v2-bad` rolled back (rollout 7)
+> error_rate=0.2812 exceeds max 0.05; ...
+```
+
+Generic webhooks get JSON (`event`, `at`, `rollout{id, app, image, state, reason, weight}`)
+plus a `delivery_id`, which is also in the `X-Canary-Delivery` header.
+
+**Delivery uses a transactional outbox.** The engine never makes HTTP calls. It writes a
+`notifications` row per (event, sink) in the **same transaction** as the state change,
+and a dispatcher in the controller loop delivers due rows:
+
+- **A crash can't lose an alert.** If the rollback committed, so did its notification.
+- **A Slack outage can't slow or break a rollout.** Failures retry with exponential
+  backoff (10 s, 20 s, 40 s … capped at 10 min), and give up after 6 attempts.
+- **At least once.** A crash between sending and recording "sent" means a resend, so
+  receivers should dedupe on `delivery_id`.
+- **One row per sink.** Retrying a failed Slack post never re-sends to a webhook that
+  already succeeded.
+- **Known limit:** rows are delivered in id order, but a retried "started" can arrive
+  after the "rolled_back" that followed it. Receivers should go by `at`, not arrival order.
+
+Try it locally with a stand-in receiver that fails its first two requests:
+
+```bash
+python scripts/webhook_receiver.py 8090 2
+CANARY_WEBHOOK_URLS=http://127.0.0.1:8090/hook CANARY_SLACK_WEBHOOK_URL=http://127.0.0.1:8090/slack make demo-run-gateway
+```
+
+From a real run: both "started" deliveries got a 503, were retried 10 s later and
+delivered once each (`GET /rollouts/7/notifications` shows `sent`, `attempts=1`).
+
+## CI: roll out after merge
+
+`canary-rollout` starts a rollout and blocks until it finishes:
+
+```bash
+canary-rollout --api https://canary.example.com --app demo --image demo-app:abc123 \
+  [--policy policies/gateway.yaml] [--timeout 1800] [--abort-on-timeout]
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | succeeded |
+| 1 | rolled back or aborted |
+| 2 | couldn't tell: timeout, API unreachable, or another rollout already active |
+
+It retries dropped connections and 5xx responses, and prints `::error::` lines that
+GitHub Actions shows as annotations.
+
+**GitHub Action** (`.github/actions/canary-rollout`):
+
+```yaml
+- uses: Awesomeav23/canary-controller/.github/actions/canary-rollout@main
+  with:
+    api-url: ${{ vars.CANARY_API_URL }}
+    token: ${{ secrets.CANARY_API_TOKEN }}
+    app: demo
+    image: ghcr.io/you/demo-app:${{ github.sha }}
+```
+
+Outputs: `rollout-id`, `state`, `reason`. `.github/workflows/deploy.yml` runs it after CI
+passes on `main`. It is skipped until `CANARY_API_URL` is set, and it never cancels a
+rollout in flight (a concurrency group per app).
+
+**How it's tested:** the `action-e2e` CI job starts a real controller (MySQL, migrations,
+API token) inside the runner and runs the real Action against it. There's no Prometheus
+there, so the controller must fail closed. The job checks that the Action reports
+`rolled_back`, fails its step, and that writes without the token get 401. `actionlint`
+checks every workflow, including inputs passed to the local Action.
 
 ## Controller metrics
 
@@ -304,6 +392,12 @@ make migration m="add foo column"  # draft a new one from model changes, then re
   per-backend metrics.
 - **Failures are isolated.** An exception on one rollout is logged and rolled back
   without stalling the others (`test_one_failing_rollout_does_not_block_others`).
+- **Baseline before the first shift.** Found on kind: a one-step 100% policy never saw
+  stable traffic, so its `max_over_stable` checks could never pass. Stable is now
+  snapshotted before step 0 (`test_baseline_captured_before_first_traffic_shift`).
+- **CI waits on the controller and doesn't duplicate it.** The Action holds no rollout
+  logic. It starts a rollout and reports what the controller decided, so a cancelled CI
+  job can't leave a half-finished rollout behind, because the controller owns it.
 
 ## Roadmap
 
@@ -317,8 +411,8 @@ make migration m="add foo column"  # draft a new one from model changes, then re
       Prometheus metrics for the controller itself (outcomes, time to rollback)
 - [x] **Week 5:** Weighted traffic with Gateway API `HTTPRoute` (Envoy Gateway): 5%
       steps, instant rollback, waits for pod readiness, `promoting` state
-- [ ] **Week 6:** Slack/webhook notifications; a GitHub Action that starts a rollout after
-      merge
+- [x] **Week 6:** Slack/webhook notifications (transactional outbox, retries); API token;
+      `canary-rollout` CLI + GitHub Action, tested end to end in CI
 - [ ] **Stretch:** LLM summary of why a rollout failed (metrics + recent log lines),
       added to the rollback event
 - [ ] **Stretch:** Deploy the controller itself to EKS with RDS MySQL

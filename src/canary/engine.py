@@ -19,7 +19,7 @@ commit succeeds, so a rolled-back transaction never reports an outcome that didn
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from canary.analysis import evaluate
 from canary.metrics import MetricsSource
 from canary.models import ACTIVE_STATES, DeployFreeze, Rollout, RolloutEvent, RolloutState, utcnow
+from canary.notify import enqueue
 from canary.policy import Policy, Step
 from canary.router import TrafficRouter
 from canary.telemetry import (
@@ -58,8 +59,10 @@ class Engine:
         router: TrafficRouter,
         metrics: MetricsSource,
         clock: Callable[[], datetime] = utcnow,
+        notify_sinks: Sequence[str] = (),
     ):
         self.sessions = sessions
+        self.notify_sinks = tuple(notify_sinks)
         self.router = router
         self.metrics = metrics
         self.clock = clock
@@ -149,9 +152,7 @@ class Engine:
             return
 
         canary = self._readings(policy, r.app, "canary")
-        if self._requests(r.app, "stable", window) >= policy.min_requests:
-            r.baseline = self._readings(policy, r.app, "stable")
-        # else: keep the last trusted baseline (e.g. stable has no pods at the 100% step)
+        self._refresh_baseline(r, policy)
 
         verdict = evaluate(policy.thresholds, canary, r.baseline)
         summary = "healthy" if verdict.healthy else "; ".join(verdict.reasons)
@@ -199,8 +200,19 @@ class Engine:
             self._finish(s, r, RolloutState.ABORTED, reason)
         self._record_telemetry(s)
 
+    def _refresh_baseline(self, r: Rollout, policy: Policy) -> None:
+        """Save stable's readings if it has enough traffic to trust; else keep the last ones
+        (stable gets no traffic at a 100% step)."""
+        window = policy.analysis_window_seconds
+        if self._requests(r.app, "stable", window) >= policy.min_requests:
+            r.baseline = self._readings(policy, r.app, "stable")
+
     def _enter_step(self, s: Session, r: Rollout, policy: Policy, index: int, now: datetime):
         step = policy.steps[index]
+        if index == 0:
+            # Snapshot stable before any traffic moves, while it still serves everyone.
+            # Without this, a policy whose first step is 100% never gets a baseline.
+            self._refresh_baseline(r, policy)
         r.step_index = index
         r.step_started_at = now
         r.traffic_shifted_at = None
@@ -216,9 +228,10 @@ class Engine:
 
     def _traffic_shifted(self, s: Session, r: Rollout, step: Step, now: datetime) -> None:
         r.traffic_shifted_at = now  # the step's pause counts from here
+        self._event(s, r, "step", f"step {r.step_index}: canary at {step.weight}%")
         if r.started_at is None:
             r.started_at = now
-        self._event(s, r, "step", f"step {r.step_index}: canary at {step.weight}%")
+            enqueue(s, r, "started", self.notify_sinks, now)
 
     def _try_promote(self, s: Session, r: Rollout, policy: Policy) -> None:
         if self.router.promote(r.app, r.image, policy.total_replicas):
@@ -233,6 +246,7 @@ class Engine:
         r.active_app = None  # frees the app for its next rollout
         self._event(s, r, state.value, reason)
         log.info("rollout %s (%s) %s: %s", r.id, r.app, state.value, reason)
+        enqueue(s, r, state.value, self.notify_sinks, self.clock())  # same transaction
 
         self._queue(s, ROLLOUTS_FINISHED.labels(r.app, state.value).inc)
         if r.started_at is not None:  # aborted while pending: the canary never ran

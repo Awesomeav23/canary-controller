@@ -35,3 +35,8 @@ TICK_DURATION = Histogram(
 ADVANCE_ERRORS = Counter(
     "canary_advance_errors_total", "Unexpected exceptions while advancing a rollout"
 )
+NOTIFICATIONS = Counter(
+    "canary_notifications_total",
+    "Notification delivery attempts",
+    ["sink", "result"],  # result: sent | retry | failed
+)

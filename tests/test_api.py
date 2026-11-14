@@ -67,3 +67,56 @@ def test_list_filters_by_app(client):
     client.post("/rollouts", json={"app": "a", "image": "a:1"})
     client.post("/rollouts", json={"app": "b", "image": "b:1"})
     assert [r["app"] for r in client.get("/rollouts", params={"app_name": "a"}).json()] == ["a"]
+
+
+# --- auth (Week 6) -------------------------------------------------------------
+
+
+@pytest.fixture
+def secured(sessions, router, metrics):
+    app = create_app(
+        Settings(api_token="s3cret"),
+        sessions=sessions,
+        router=router,
+        metrics=metrics,
+        sinks={},
+        run_loop=False,
+    )
+    with TestClient(app) as c:
+        yield c
+
+
+AUTH = {"Authorization": "Bearer s3cret"}
+
+
+def test_writes_need_the_token(secured):
+    body = {"app": "demo", "image": "demo:v2"}
+    assert secured.post("/rollouts", json=body).status_code == 401
+    assert (
+        secured.post("/rollouts", json=body, headers={"Authorization": "Bearer nope"}).status_code
+        == 401
+    )
+    assert secured.put("/freezes/demo", json={"reason": "x"}).status_code == 401
+    assert secured.delete("/freezes/demo").status_code == 401
+    rid = secured.post("/rollouts", json=body, headers=AUTH).json()["id"]
+    assert secured.post(f"/rollouts/{rid}/abort").status_code == 401
+    assert secured.post(f"/rollouts/{rid}/abort", headers=AUTH).status_code == 200
+
+
+def test_reads_stay_open(secured):
+    rid = secured.post("/rollouts", json={"app": "demo", "image": "demo:v2"}, headers=AUTH).json()[
+        "id"
+    ]
+    for path in (
+        "/rollouts",
+        f"/rollouts/{rid}",
+        f"/rollouts/{rid}/notifications",
+        "/freezes",
+        "/metrics",
+        "/healthz",
+    ):
+        assert secured.get(path).status_code == 200, path
+
+
+def test_no_token_configured_means_open(client):
+    assert client.post("/rollouts", json={"app": "demo", "image": "demo:v2"}).status_code == 201

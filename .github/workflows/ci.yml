@@ -14,6 +14,77 @@ jobs:
         with: { python-version: "3.12", cache: pip }
       - run: pip install -e '.[dev]'
       - run: ruff check . && ruff format --check .
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  # Runs the real composite action against a real controller started in this job.
+  # There's no Prometheus here, so the controller sees no metrics and must fail closed:
+  # the action should report rolled_back and fail its step.
+  action-e2e:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: canary
+          MYSQL_USER: canary
+          MYSQL_PASSWORD: canary
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=3s --health-retries=30
+    env:
+      CANARY_DATABASE_URL: mysql+pymysql://canary:canary@127.0.0.1:3306/canary
+      CANARY_API_TOKEN: ci-test-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e .
+      - run: alembic upgrade head
+      - name: Start controller
+        run: |
+          CANARY_ROUTER=log CANARY_TICK_SECONDS=1 \
+            nohup uvicorn --factory canary.api:create_app --port 8020 > controller.log 2>&1 &
+          for _ in $(seq 30); do curl -sf localhost:8020/healthz && exit 0; sleep 1; done
+          cat controller.log; exit 1
+      - name: Writes need the token
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8020/rollouts \
+            -H 'content-type: application/json' -d '{"app":"x","image":"x:1"}')
+          test "$code" = 401
+      - name: Fast policy
+        run: |
+          cat > fast.yaml <<'EOF'
+          min_requests: 0
+          steps: [{ weight: 50, pause_seconds: 1 }, { weight: 100, pause_seconds: 1 }]
+          thresholds: [{ metric: error_rate, max: 0.05 }]
+          EOF
+      - uses: ./.github/actions/canary-rollout
+        id: canary
+        continue-on-error: true
+        with:
+          api-url: http://localhost:8020
+          token: ci-test-token
+          app: demo
+          image: demo-app:e2e
+          policy-file: fast.yaml
+          timeout-seconds: "60"
+      - name: Action reported the rollback
+        env:
+          OUTCOME: ${{ steps.canary.outcome }}
+          STATE: ${{ steps.canary.outputs.state }}
+          REASON: ${{ steps.canary.outputs.reason }}
+          ROLLOUT_ID: ${{ steps.canary.outputs.rollout-id }}
+        run: |
+          echo "outcome=$OUTCOME state=$STATE id=$ROLLOUT_ID reason=$REASON"
+          test "$OUTCOME" = failure
+          test "$STATE" = rolled_back
+          test -n "$ROLLOUT_ID"
+          case "$REASON" in *"no data"*) ;; *) exit 1 ;; esac
+      - if: failure()
+        run: cat controller.log
 
   test:
     runs-on: ubuntu-latest
