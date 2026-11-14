@@ -62,13 +62,11 @@ prometheus-forward:  ## Expose in-cluster Prometheus on :9095 (leave running)
 demo-run:  ## Run the controller against the kind cluster
 	CANARY_ROUTER=kubernetes $(BIN)/uvicorn --factory canary.api:create_app --port 8020
 
-rollout-good:  ## Start a rollout that should succeed
-	curl -s -XPOST $(API)/rollouts -H 'content-type: application/json' \
-	  -d '{"app":"demo","image":"demo-app:v2"}' | python3 -m json.tool
+rollout-good:  ## Start a rollout that should succeed, and watch it (~3 min)
+	$(BIN)/python scripts/watch_rollout.py demo-app:v2 demo $(API)
 
-rollout-bad:  ## Start a rollout that should auto-rollback
-	curl -s -XPOST $(API)/rollouts -H 'content-type: application/json' \
-	  -d '{"app":"demo","image":"demo-app:v2-bad"}' | python3 -m json.tool
+rollout-bad:  ## Start a rollout that should auto-rollback, and watch it (~1 min)
+	$(BIN)/python scripts/watch_rollout.py demo-app:v2-bad demo $(API)
 
 status:  ## Show recent rollouts and pod split
 	curl -s '$(API)/rollouts?limit=5' | python3 -m json.tool

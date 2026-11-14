@@ -10,8 +10,12 @@ log = logging.getLogger(__name__)
 
 # {app}, {track} and {window} are filled in per query. Metric names match demo-app/app.py.
 QUERIES = {
+    # A pod that has never returned a 5xx has no 5xx series at all, so the numerator would
+    # be empty and the whole query "no data". `or vector(0)` turns that into 0 errors.
+    # No traffic at all still gives an empty denominator, so we still fail closed.
     "error_rate": (
-        'sum(rate(http_requests_total{{app="{app}",track="{track}",status=~"5.."}}[{window}s]))'
+        '(sum(rate(http_requests_total{{app="{app}",track="{track}",status=~"5.."}}[{window}s]))'
+        " or vector(0))"
         ' / sum(rate(http_requests_total{{app="{app}",track="{track}"}}[{window}s]))'
     ),
     "p95_latency_ms": (
@@ -28,8 +32,10 @@ class MetricsSource(Protocol):
 
 
 class PrometheusMetrics:
-    def __init__(self, base_url: str, timeout: float = 5.0):
-        self._client = httpx.Client(base_url=base_url, timeout=timeout)
+    def __init__(
+        self, base_url: str, timeout: float = 5.0, transport: httpx.BaseTransport | None = None
+    ):
+        self._client = httpx.Client(base_url=base_url, timeout=timeout, transport=transport)
 
     def query(self, metric: str, app: str, track: str, window_seconds: int) -> float | None:
         promql = QUERIES[metric].format(app=app, track=track, window=window_seconds)

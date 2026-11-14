@@ -65,6 +65,44 @@ make rollout-bad             # v2-bad (30% errors) is rolled back at the first s
 make status
 ```
 
+Real output from a run on kind:
+
+```text
+$ make rollout-good
+[   4s] step         step 0: canary at 25%      | demo-stable=3 demo-canary=1
+[  65s] analysis     step 0 (25%): healthy      | demo-stable=2 demo-canary=2
+[ 124s] analysis     step 1 (50%): healthy      | demo-stable=0 demo-canary=4
+[ 185s] analysis     step 2 (100%): healthy     | demo-stable=4 demo-canary=0
+[ 185s] succeeded    all steps healthy
+FINAL: succeeded - all steps healthy
+
+$ make rollout-bad
+[   4s] step         step 0: canary at 25%                          | demo-stable=3 demo-canary=1
+[  65s] analysis     step 0 (25%): error_rate=0.3074 exceeds max 0.05 | demo-stable=4 demo-canary=0
+[  65s] rolled_back  error_rate=0.3074 exceeds max 0.05
+FINAL: rolled_back - error_rate=0.3074 exceeds max 0.05
+```
+
+The bad version only ever reached 1 of 4 pods, and was gone 65 seconds after it started.
+
+### What the first real run caught
+
+The unit tests all passed, yet the first run on a real cluster rolled back a **healthy**
+release. Two separate causes:
+
+1. **A PromQL edge case.** The error rate is `5xx requests / all requests`. A version
+   that has never returned a 5xx has no 5xx series in Prometheus at all, so the query
+   returned nothing instead of `0`. The controller fails closed on missing data, so it
+   rolled back. Fix: `(errors or vector(0)) / total`. Regression test in
+   `tests/test_metrics.py`.
+2. **The load generator stalled.** It was one `curl` loop with no timeout. When stable
+   pods were scaled away, a request hung on a dead connection and traffic dropped to
+   zero, so the canary had no data at 100%. Fix: four parallel loops with request
+   timeouts.
+
+In both cases failing closed was the right behaviour. A canary the controller can't
+measure should not be promoted.
+
 ## API
 
 | Method | Path | Purpose |
@@ -99,7 +137,9 @@ make status
 ## Roadmap
 
 - [x] **Week 1:** State machine, policy, MySQL persistence, API, unit tests, CI
-- [ ] **Week 2:** Run the full kind demo end to end and record a GIF of an auto-rollback
+- [x] **Week 2:** Run the full kind demo end to end (good rollout promoted, bad one
+      rolled back); fixed two bugs it surfaced
+- [ ] **Week 2 polish:** Record a GIF of `make rollout-bad` for the top of this README
 - [ ] **Week 3:** Compare canary against stable instead of only fixed thresholds; add a
       minimum request count before judging
 - [ ] **Week 4:** Alembic migrations; Prometheus metrics for the controller itself

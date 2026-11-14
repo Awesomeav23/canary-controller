@@ -1,4 +1,6 @@
-# Steady ~20 req/s against the demo Service so the canary has metrics to judge.
+# Steady traffic against the demo Service so the canary has metrics to judge.
+# Four parallel loops with request timeouts: a single loop with no timeout hung forever
+# on a connection to a pod that was scaled away, and traffic dropped to zero mid-rollout.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,4 +15,14 @@ spec:
       containers:
         - name: curl
           image: curlimages/curl:8.10.1
-          command: ["sh", "-c", "while true; do curl -s -o /dev/null http://demo/; sleep 0.05; done"]
+          command:
+            - sh
+            - -c
+            - |
+              for i in 1 2 3 4; do
+                (while true; do
+                  curl -s -o /dev/null --connect-timeout 1 --max-time 2 http://demo/
+                  sleep 0.1
+                done) &
+              done
+              wait
