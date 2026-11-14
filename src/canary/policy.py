@@ -43,6 +43,9 @@ class Policy(BaseModel):
     min_requests: int = Field(default=50, ge=0)
     # How long past a step's pause to wait for min_requests before giving up (rolling back).
     max_wait_for_traffic_seconds: int = Field(default=120, ge=0)
+    # How long canary pods get to become ready at each step before the rollout gives up
+    # (a crash-looping or unpullable image never gets ready).
+    pod_ready_timeout_seconds: int = Field(default=180, ge=10)
     steps: list[Step] = Field(min_length=1)
     thresholds: list[Threshold] = Field(min_length=1)
 

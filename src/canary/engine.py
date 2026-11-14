@@ -1,9 +1,13 @@
 """The rollout state machine.
 
-    pending --(no freeze)--> progressing --(all steps healthy)--> succeeded
+    pending --(no freeze)--> progressing --(all steps healthy)--> promoting --> succeeded
                                   |
-                                  +--(a step fails analysis)--> rolled_back
+                                  +--(a step fails, or pods never ready)--> rolled_back
     pending/progressing --(abort API)--> aborted
+
+Each step: move traffic (once canary pods are ready) -> pause -> check traffic volume
+-> analyse. `promoting` waits for stable to run the new image (GatewayRouter only;
+ReplicaRouter promotes instantly).
 
 All state lives in MySQL, so the controller can crash and resume. Each tick re-reads
 the rollout, does at most one transition, and commits. Router calls are idempotent,
@@ -25,7 +29,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from canary.analysis import evaluate
 from canary.metrics import MetricsSource
 from canary.models import ACTIVE_STATES, DeployFreeze, Rollout, RolloutEvent, RolloutState, utcnow
-from canary.policy import Policy
+from canary.policy import Policy, Step
 from canary.router import TrafficRouter
 from canary.telemetry import (
     ACTIVE_ROLLOUTS,
@@ -41,6 +45,10 @@ log = logging.getLogger(__name__)
 
 class RolloutFinishedError(Exception):
     pass
+
+
+class RolloutBusyError(Exception):
+    """The rollout is in a state that can't be interrupted safely (promoting)."""
 
 
 class Engine:
@@ -97,8 +105,27 @@ class Engine:
             self._enter_step(s, r, policy, 0, now)
             return
 
+        if r.state == RolloutState.PROMOTING:
+            self._try_promote(s, r, policy)
+            return
+
         step = policy.steps[r.step_index]
-        waited = now - r.step_started_at
+        if r.traffic_shifted_at is None:
+            # Waiting for canary pods before this step's traffic can move.
+            if self.router.set_weight(r.app, r.image, step.weight, policy.total_replicas):
+                self._traffic_shifted(s, r, step, now)
+            elif now - r.step_started_at >= timedelta(seconds=policy.pod_ready_timeout_seconds):
+                self.router.rollback(r.app, policy.total_replicas)
+                self._finish(
+                    s,
+                    r,
+                    RolloutState.ROLLED_BACK,
+                    f"canary pods not ready after {policy.pod_ready_timeout_seconds}s"
+                    f" (step {r.step_index}, {step.weight}%)",
+                )
+            return
+
+        waited = now - r.traffic_shifted_at
         if waited < timedelta(seconds=step.pause_seconds):
             return  # still baking
 
@@ -142,8 +169,7 @@ class Engine:
             self.router.rollback(r.app, policy.total_replicas)
             self._finish(s, r, RolloutState.ROLLED_BACK, "; ".join(verdict.reasons))
         elif r.step_index == len(policy.steps) - 1:
-            self.router.promote(r.app, r.image, policy.total_replicas)
-            self._finish(s, r, RolloutState.SUCCEEDED, "all steps healthy")
+            self._try_promote(s, r, policy)
         else:
             self._enter_step(s, r, policy, r.step_index + 1, now)
 
@@ -163,6 +189,10 @@ class Engine:
                 raise LookupError(rollout_id)
             if r.state not in ACTIVE_STATES:
                 raise RolloutFinishedError(r.state)
+            if r.state == RolloutState.PROMOTING:
+                # Stable is mid-way through rolling to the new (already verified) image.
+                # "Rolling back" now would mean a third version change, not a safe stop.
+                raise RolloutBusyError("promotion in progress")
             if r.state == RolloutState.PROGRESSING:
                 policy = Policy.model_validate(r.policy)
                 self.router.rollback(r.app, policy.total_replicas)
@@ -171,12 +201,31 @@ class Engine:
 
     def _enter_step(self, s: Session, r: Rollout, policy: Policy, index: int, now: datetime):
         step = policy.steps[index]
-        self.router.set_weight(r.app, r.image, step.weight, policy.total_replicas)
         r.step_index = index
         r.step_started_at = now
+        r.traffic_shifted_at = None
+        if self.router.set_weight(r.app, r.image, step.weight, policy.total_replicas):
+            self._traffic_shifted(s, r, step, now)
+        else:
+            self._event(
+                s,
+                r,
+                "waiting_for_pods",
+                f"step {index}: canary pods starting ({step.weight}% next)",
+            )
+
+    def _traffic_shifted(self, s: Session, r: Rollout, step: Step, now: datetime) -> None:
+        r.traffic_shifted_at = now  # the step's pause counts from here
         if r.started_at is None:
             r.started_at = now
-        self._event(s, r, "step", f"step {index}: canary at {step.weight}%")
+        self._event(s, r, "step", f"step {r.step_index}: canary at {step.weight}%")
+
+    def _try_promote(self, s: Session, r: Rollout, policy: Policy) -> None:
+        if self.router.promote(r.app, r.image, policy.total_replicas):
+            self._finish(s, r, RolloutState.SUCCEEDED, "all steps healthy")
+        elif r.state != RolloutState.PROMOTING:
+            r.state = RolloutState.PROMOTING
+            self._event(s, r, "promoting", f"all steps healthy; rolling stable to {r.image}")
 
     def _finish(self, s: Session, r: Rollout, state: RolloutState, reason: str) -> None:
         r.state = state

@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 class Settings:
     database_url: str = "mysql+pymysql://canary:canary@127.0.0.1:3307/canary"
     prometheus_url: str = "http://127.0.0.1:9095"
-    router: str = "log"  # "log" (no cluster needed) or "kubernetes"
+    router: str = "log"  # "log" (no cluster), "replicas", or "gateway"
     namespace: str = "default"
     tick_seconds: float = 5.0
     default_policy_path: str = field(default=str(REPO_ROOT / "policies" / "default.yaml"))

@@ -32,12 +32,13 @@ class Base(DeclarativeBase):
 class RolloutState(StrEnum):
     PENDING = "pending"
     PROGRESSING = "progressing"
+    PROMOTING = "promoting"  # passed every step; waiting for stable to run the new image
     SUCCEEDED = "succeeded"
     ROLLED_BACK = "rolled_back"
     ABORTED = "aborted"
 
 
-ACTIVE_STATES = (RolloutState.PENDING, RolloutState.PROGRESSING)
+ACTIVE_STATES = (RolloutState.PENDING, RolloutState.PROGRESSING, RolloutState.PROMOTING)
 
 
 class Rollout(Base):
@@ -50,6 +51,9 @@ class Rollout(Base):
     state: Mapped[str] = mapped_column(String(20), default=RolloutState.PENDING, index=True)
     step_index: Mapped[int] = mapped_column(default=-1)
     step_started_at: Mapped[datetime | None] = mapped_column(Timestamp)
+    # When this step's traffic actually moved. NULL while waiting for canary pods to be
+    # ready; the step's pause only starts counting from here.
+    traffic_shifted_at: Mapped[datetime | None] = mapped_column(Timestamp)
     # When the canary first got traffic (step 0). Rollout duration and time-to-rollback
     # are measured from here, not from creation, so freeze/queue time doesn't count.
     started_at: Mapped[datetime | None] = mapped_column(Timestamp)
@@ -70,8 +74,12 @@ class Rollout(Base):
 
     @property
     def current_weight(self) -> int:
-        if self.state == RolloutState.SUCCEEDED:
+        if self.state in (RolloutState.SUCCEEDED, RolloutState.PROMOTING):
             return 100
+        if self.state == RolloutState.PROGRESSING and self.traffic_shifted_at is None:
+            return (
+                int(self.policy["steps"][self.step_index - 1]["weight"]) if self.step_index else 0
+            )
         if self.state == RolloutState.PROGRESSING and self.step_index >= 0:
             return int(self.policy["steps"][self.step_index]["weight"])
         return 0

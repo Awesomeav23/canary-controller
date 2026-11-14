@@ -1,6 +1,6 @@
 import pytest
 
-from canary.engine import Engine, RolloutFinishedError
+from canary.engine import Engine, RolloutBusyError, RolloutFinishedError
 from canary.models import DeployFreeze, Rollout, RolloutState
 
 
@@ -244,3 +244,109 @@ def test_one_failing_rollout_does_not_block_others(engine, sessions, router, pol
 
     assert get(sessions, broken).state == RolloutState.PENDING  # transaction rolled back
     assert get(sessions, healthy).state == RolloutState.PROGRESSING
+
+
+# --- Week 5: waiting for pods, promoting -------------------------------------
+
+
+def test_pause_starts_when_traffic_moves_not_when_step_starts(
+    engine, sessions, router, clock, policy
+):
+    router.canary_ready = False
+    rid = create(sessions, policy)
+    engine.tick()
+    r = get(sessions, rid)
+    assert r.state == RolloutState.PROGRESSING and r.traffic_shifted_at is None
+    assert r.current_weight == 0
+    assert r.events[-1].kind == "waiting_for_pods"
+
+    clock.advance(90)  # pods take 90s; the 60s pause must not have been "used up"
+    router.canary_ready = True
+    engine.tick()
+    r = get(sessions, rid)
+    assert r.traffic_shifted_at == clock.now and r.current_weight == 25
+
+    clock.advance(59)
+    engine.tick()
+    assert get(sessions, rid).step_index == 0  # still baking
+    clock.advance(1)
+    engine.tick()
+    assert get(sessions, rid).step_index == 1
+
+
+def test_canary_pods_never_ready_rolls_back(engine, sessions, router, clock, policy):
+    router.canary_ready = False
+    rid = create(sessions, policy)
+    engine.tick()
+
+    clock.advance(179)
+    engine.tick()
+    assert get(sessions, rid).state == RolloutState.PROGRESSING
+
+    clock.advance(1)
+    engine.tick()
+    r = get(sessions, rid)
+    assert r.state == RolloutState.ROLLED_BACK
+    assert r.reason == "canary pods not ready after 180s (step 0, 25%)"
+    assert router.calls[-1] == ("rollback", "demo", 4)
+    assert r.started_at is None  # the canary never got traffic
+
+
+def test_promotion_waits_for_stable_without_reanalysing(
+    engine, sessions, router, metrics, clock, policy
+):
+    rid = create(sessions, policy)
+    engine.tick()
+    for _ in range(2):
+        clock.advance(60)
+        engine.tick()
+
+    router.stable_ready = False
+    clock.advance(60)
+    engine.tick()
+    r = get(sessions, rid)
+    assert r.state == RolloutState.PROMOTING
+    assert r.active_app == "demo"  # still blocks a second rollout
+    analyses = [e.kind for e in r.events].count("analysis")
+
+    metrics.canary["error_rate"] = 0.9  # analysis is over: must not be re-run
+    for _ in range(3):
+        clock.advance(10)
+        engine.tick()
+    r = get(sessions, rid)
+    assert r.state == RolloutState.PROMOTING
+    assert [e.kind for e in r.events].count("analysis") == analyses
+    assert [e.kind for e in r.events].count("promoting") == 1
+
+    router.stable_ready = True
+    engine.tick()
+    r = get(sessions, rid)
+    assert r.state == RolloutState.SUCCEEDED and r.active_app is None
+
+
+def test_cannot_abort_while_promoting(engine, sessions, router, clock, policy):
+    rid = create(sessions, policy)
+    engine.tick()
+    for _ in range(2):
+        clock.advance(60)
+        engine.tick()
+    router.stable_ready = False
+    clock.advance(60)
+    engine.tick()
+
+    with pytest.raises(RolloutBusyError):
+        engine.abort(rid, "too late")
+    assert get(sessions, rid).state == RolloutState.PROMOTING
+
+
+def test_restart_while_waiting_for_pods(sessions, router, metrics, clock, policy):
+    router.canary_ready = False
+    rid = create(sessions, policy)
+    Engine(sessions, router, metrics, clock=clock).tick()
+
+    router.canary_ready = True
+    clock.advance(30)
+    Engine(sessions, router, metrics, clock=clock).tick()  # a fresh controller
+    r = get(sessions, rid)
+    assert r.traffic_shifted_at == clock.now
+    assert router.calls.count(("set_weight", "demo", "demo:v2", 25, 4)) == 2  # retried

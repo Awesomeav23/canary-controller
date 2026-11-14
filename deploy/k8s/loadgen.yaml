@@ -15,13 +15,16 @@ spec:
       containers:
         - name: curl
           image: curlimages/curl:8.10.1
+          env:
+            # Replica mode hits the Service; `make gateway-deploy` repoints it at Envoy.
+            - { name: TARGET, value: "http://demo/" }
           command:
             - sh
             - -c
             - |
               for i in 1 2 3 4; do
                 (while true; do
-                  curl -s -o /dev/null --connect-timeout 1 --max-time 2 http://demo/
+                  curl -s -o /dev/null --connect-timeout 1 --max-time 2 "$TARGET"
                   sleep 0.1
                 done) &
               done

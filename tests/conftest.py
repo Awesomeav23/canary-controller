@@ -9,9 +9,13 @@ from canary.policy import Policy, Step, Threshold
 
 
 class FakeRouter:
+    """Records calls. Flip canary_ready / stable_ready to simulate pods still starting."""
+
     def __init__(self):
         self.calls: list[tuple] = []
         self.fail_for: set[str] = set()
+        self.canary_ready = True
+        self.stable_ready = True
 
     def _record(self, *call):
         if call[1] in self.fail_for:
@@ -20,9 +24,11 @@ class FakeRouter:
 
     def set_weight(self, app, image, weight, total):
         self._record("set_weight", app, image, weight, total)
+        return self.canary_ready
 
     def promote(self, app, image, total):
         self._record("promote", app, image, total)
+        return self.stable_ready
 
     def rollback(self, app, total):
         self._record("rollback", app, total)

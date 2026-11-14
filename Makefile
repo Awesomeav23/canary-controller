@@ -6,7 +6,8 @@ TEST_DB := mysql+pymysql://canary:canary@127.0.0.1:3307/canary_test
 
 .PHONY: help up venv db-up db-down test test-mysql lint fmt run \
         cluster cluster-down images deploy prometheus-forward demo-run \
-        rollout-good rollout-bad rollout-slow status db-reset migrate migration
+        rollout-good rollout-bad rollout-slow status db-reset migrate migration \
+        gateway-install gateway-deploy demo-run-gateway rollout-gateway-good rollout-gateway-bad
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-20s %s\n", $$1, $$2}'
@@ -72,8 +73,8 @@ deploy:  ## Apply demo app, load generator and Prometheus
 prometheus-forward:  ## Expose in-cluster Prometheus on :9095 (leave running)
 	kubectl port-forward svc/prometheus 9095:9090
 
-demo-run: migrate  ## Run the controller against the kind cluster
-	CANARY_ROUTER=kubernetes $(BIN)/uvicorn --factory canary.api:create_app --port 8020
+demo-run: migrate  ## Run the controller against the kind cluster (pod-ratio routing)
+	CANARY_ROUTER=replicas $(BIN)/uvicorn --factory canary.api:create_app --port 8020
 
 rollout-good:  ## Start a rollout that should succeed, and watch it (~3 min)
 	$(BIN)/python scripts/watch_rollout.py demo-app:v2 demo $(API)
@@ -83,6 +84,29 @@ rollout-bad:  ## Start a rollout that should auto-rollback, and watch it (~1 min
 
 rollout-slow:  ## Rollout under the 500ms ceiling but 150ms slower than stable: rolled back
 	$(BIN)/python scripts/watch_rollout.py demo-app:v2-slow demo $(API)
+
+# --- weighted routing with Gateway API (Week 5) -------------------------------
+ENVOY_GATEWAY_VERSION := v1.9.3
+GATEWAY_POLICY := policies/gateway.yaml
+
+gateway-install:  ## Install Envoy Gateway (CRDs + controller) into the kind cluster
+	kubectl apply --server-side -f https://github.com/envoyproxy/gateway/releases/download/$(ENVOY_GATEWAY_VERSION)/install.yaml
+	kubectl wait --timeout=5m -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
+
+gateway-deploy:  ## Create the Gateway + HTTPRoute and send load through Envoy
+	kubectl apply -f deploy/gateway/
+	kubectl wait --timeout=3m gateway/demo-gw --for=condition=Programmed
+	kubectl set env deploy/loadgen TARGET=http://demo-gateway.envoy-gateway-system/
+	kubectl rollout status deploy/loadgen --timeout=60s
+
+demo-run-gateway: migrate  ## Run the controller with weighted routing
+	CANARY_ROUTER=gateway $(BIN)/uvicorn --factory canary.api:create_app --port 8020
+
+rollout-gateway-good:  ## 5% -> 25% -> 50% -> 100%, promoted (~5 min)
+	$(BIN)/python scripts/watch_rollout.py demo-app:v2 demo $(API) $(GATEWAY_POLICY)
+
+rollout-gateway-bad:  ## Bad release caught at 5% of traffic, not 25%
+	$(BIN)/python scripts/watch_rollout.py demo-app:v2-bad demo $(API) $(GATEWAY_POLICY)
 
 status:  ## Show recent rollouts and pod split
 	curl -s '$(API)/rollouts?limit=5' | python3 -m json.tool

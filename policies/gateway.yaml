@@ -1,0 +1,17 @@
+# Fine-grained policy for the GatewayRouter. With ReplicaRouter and 4 pods, 5% would
+# really be 25% (one pod), so use policies/default.yaml there.
+total_replicas: 4
+analysis_window_seconds: 60
+min_requests: 50
+max_wait_for_traffic_seconds: 120
+pod_ready_timeout_seconds: 180
+
+steps:
+  - { weight: 5, pause_seconds: 60 }   # a bad release reaches 5% of users, not 25%
+  - { weight: 25, pause_seconds: 60 }
+  - { weight: 50, pause_seconds: 60 }
+  - { weight: 100, pause_seconds: 60 }
+
+thresholds:
+  - { metric: error_rate, max: 0.05, max_over_stable: 0.01 }
+  - { metric: p95_latency_ms, max: 500, max_over_stable: 100 }

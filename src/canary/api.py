@@ -16,11 +16,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from canary.config import Settings
 from canary.db import make_sessionmaker, require_schema_current
-from canary.engine import Engine, RolloutFinishedError
+from canary.engine import Engine, RolloutBusyError, RolloutFinishedError
 from canary.metrics import MetricsSource, PrometheusMetrics
 from canary.models import DeployFreeze, Rollout, RolloutEvent
 from canary.policy import Policy, load_policy
-from canary.router import KubernetesRouter, LogRouter, TrafficRouter
+from canary.router import GatewayRouter, LogRouter, ReplicaRouter, TrafficRouter
 
 log = logging.getLogger(__name__)
 
@@ -77,8 +77,10 @@ class FreezeOut(BaseModel):
 
 
 def build_router(settings: Settings) -> TrafficRouter:
-    if settings.router == "kubernetes":
-        return KubernetesRouter(settings.namespace)
+    if settings.router in ("replicas", "kubernetes"):  # "kubernetes" = pre-week-5 name
+        return ReplicaRouter(settings.namespace)
+    if settings.router == "gateway":
+        return GatewayRouter(settings.namespace)
     if settings.router == "log":
         return LogRouter()
     raise ValueError(f"unknown router {settings.router!r}")
@@ -192,6 +194,8 @@ def create_app(
             raise HTTPException(404, f"rollout {rollout_id} not found") from None
         except RolloutFinishedError as e:
             raise HTTPException(409, f"rollout already finished ({e})") from None
+        except RolloutBusyError as e:
+            raise HTTPException(409, f"can't abort: {e}") from None
         return RolloutOut.model_validate(load(s, rollout_id))
 
     @app.get("/freezes")

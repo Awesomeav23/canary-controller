@@ -88,7 +88,7 @@ def test_started_at_backfill(blank_db):
 def test_app_refuses_to_start_on_old_schema(blank_db):
     migrate(blank_db.kw["bind"], "0002")
     app = create_app(Settings(), sessions=blank_db, run_loop=False)
-    with pytest.raises(SchemaOutOfDateError, match="at 0002, code expects 0003"):
+    with pytest.raises(SchemaOutOfDateError, match=f"at 0002, code expects {head_revision()}"):
         with TestClient(app):
             pass
 
@@ -98,3 +98,34 @@ def test_app_starts_on_current_schema(blank_db):
     app = create_app(Settings(), sessions=blank_db, run_loop=False)
     with TestClient(app) as client:
         assert client.get("/healthz").status_code == 200
+
+
+def test_traffic_shifted_at_backfill(blank_db):
+    """0004 copies step_started_at, so in-flight rollouts don't restart their pause."""
+    engine = blank_db.kw["bind"]
+    migrate(engine, "0003")
+    with engine.begin() as conn:
+        insert = text(
+            "INSERT INTO rollouts (id, app, image, policy, state, step_index, step_started_at,"
+            " created_at, updated_at) VALUES (:id, :app, 'img', '{}', :state, :step, :at, :t, :t)"
+        )
+        t = "2026-01-01 00:00:00"
+        conn.execute(
+            insert,
+            {
+                "id": 1,
+                "app": "mid",
+                "state": "progressing",
+                "step": 1,
+                "at": "2026-01-01 10:00:00",
+                "t": t,
+            },
+        )
+        conn.execute(
+            insert, {"id": 2, "app": "new", "state": "pending", "step": -1, "at": None, "t": t}
+        )
+    migrate(engine)
+    with engine.connect() as conn:
+        rows = dict(conn.execute(text("SELECT app, traffic_shifted_at FROM rollouts")).all())
+    assert str(rows["mid"]).startswith("2026-01-01 10:00:00")
+    assert rows["new"] is None
