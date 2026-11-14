@@ -175,8 +175,8 @@ make rollout-gateway-bad
 - **Restart-safe.** Killing the controller pod at step 1 of a 4-step rollout: the new pod
   picked it up at the same step and promoted it.
 - **Tested from scratch in CI.** The `kind-e2e` job builds a fresh kind cluster per push,
-  deploys everything, and checks a bad release is rolled back on its real error rate and a
-  good one is promoted.
+  deploys everything, and checks both routing modes: bad releases rolled back on their
+  real error rate (at 5% with the gateway), a good one promoted.
 
 The first in-cluster run found a real bug: two controller pods started together, both
 ran migrations, and MySQL (whose DDL isn't transactional) failed the second half-way with
@@ -326,7 +326,9 @@ checks every workflow, including inputs passed to the local Action.
 
 The `kind-e2e` job goes further: a fresh kind cluster, the demo app, Prometheus and the
 controller as a pod. `canary-rollout` must exit 1 for `v2-bad` (rolled back on
-`error_rate`, not on missing data) and 0 for `v2` (stable now runs `v2`).
+`error_rate`, not on missing data) and 0 for `v2` (stable now runs `v2`). Then it installs
+Envoy Gateway, switches the controller to weighted routing, and checks `v2-bad` is caught
+at the first 5% step with the route back at 0%.
 
 ## Controller metrics
 

@@ -113,8 +113,9 @@ jobs:
       - run: pytest -q
 
   # The whole thing on a fresh kind cluster: demo app, Prometheus, and the controller
-  # running as a pod with its own MySQL. One bad release must roll back on real error
-  # metrics (not "no data"), and one good release must be promoted.
+  # running as a pod with its own MySQL. Pod-ratio mode: a bad release must roll back on
+  # real error metrics (not "no data") and a good one must be promoted. Then Envoy Gateway:
+  # a bad release must be caught at the first (5%) step.
   kind-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -149,6 +150,25 @@ jobs:
           canary-rollout --api http://localhost:8020 --app demo --image demo-app:v2 --timeout 900
           kubectl get deploy demo-stable -o jsonpath='{.spec.template.spec.containers[0].image}' \
             | grep -qx demo-app:v2
+      # Mode C: weighted routing through Envoy Gateway, controller switched to it.
+      - run: make gateway-install
+      - run: make gateway-deploy
+      - run: make incluster-deploy ROUTER=gateway
+      - name: Bad release is caught at 5% of traffic
+        run: |
+          CANARY_API_TOKEN=$(make -s incluster-token)
+          export CANARY_API_TOKEN
+          set +e
+          canary-rollout --api http://localhost:8020 --app demo --image demo-app:v2-bad \
+            --policy policies/gateway.yaml --timeout 600
+          code=$?
+          set -e
+          test "$code" = 1
+          curl -s 'localhost:8020/rollouts?limit=1' | grep -q 'error_rate='
+          curl -s 'localhost:8020/rollouts?limit=1' | python3 -c \
+            "import sys,json; assert json.load(sys.stdin)[0]['step_index'] == 0"
+          kubectl get httproute demo -o jsonpath='{.spec.rules[0].backendRefs[1].weight}' \
+            | grep -qx 0
       - if: failure()
         run: |
           kubectl get pods -A
