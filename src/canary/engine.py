@@ -81,16 +81,42 @@ class Engine:
             return
 
         step = policy.steps[r.step_index]
-        if now - r.step_started_at < timedelta(seconds=step.pause_seconds):
+        waited = now - r.step_started_at
+        if waited < timedelta(seconds=step.pause_seconds):
             return  # still baking
 
-        readings = {
-            t.metric: self.metrics.query(t.metric, r.app, "canary", policy.analysis_window_seconds)
-            for t in policy.thresholds
-        }
-        verdict = evaluate(policy.thresholds, readings)
+        window = policy.analysis_window_seconds
+        canary_requests = self._requests(r.app, "canary", window)
+        if canary_requests < policy.min_requests:
+            limit = timedelta(seconds=step.pause_seconds + policy.max_wait_for_traffic_seconds)
+            detail = (
+                f"{canary_requests:.0f} canary requests in {window}s, need {policy.min_requests}"
+            )
+            if waited < limit:
+                if r.events[-1].kind != "waiting":
+                    self._event(
+                        s, r, "waiting", f"step {r.step_index}: not enough traffic ({detail})"
+                    )
+                return
+            # Low traffic is not evidence of health. Give up rather than promote blind.
+            self.router.rollback(r.app, policy.total_replicas)
+            self._finish(s, r, RolloutState.ROLLED_BACK, f"insufficient traffic: {detail}")
+            return
+
+        canary = self._readings(policy, r.app, "canary")
+        if self._requests(r.app, "stable", window) >= policy.min_requests:
+            r.baseline = self._readings(policy, r.app, "stable")
+        # else: keep the last trusted baseline (e.g. stable has no pods at the 100% step)
+
+        verdict = evaluate(policy.thresholds, canary, r.baseline)
         summary = "healthy" if verdict.healthy else "; ".join(verdict.reasons)
-        self._event(s, r, "analysis", f"step {r.step_index} ({step.weight}%): {summary}", readings)
+        self._event(
+            s,
+            r,
+            "analysis",
+            f"step {r.step_index} ({step.weight}%): {summary}",
+            {"canary": canary, "stable": r.baseline, "canary_requests": canary_requests},
+        )
 
         if not verdict.healthy:
             self.router.rollback(r.app, policy.total_replicas)
@@ -100,6 +126,15 @@ class Engine:
             self._finish(s, r, RolloutState.SUCCEEDED, "all steps healthy")
         else:
             self._enter_step(s, r, policy, r.step_index + 1, now)
+
+    def _requests(self, app: str, track: str, window: int) -> float:
+        return self.metrics.query("request_count", app, track, window) or 0.0
+
+    def _readings(self, policy: Policy, app: str, track: str) -> dict[str, float | None]:
+        window = policy.analysis_window_seconds
+        return {
+            t.metric: self.metrics.query(t.metric, app, track, window) for t in policy.thresholds
+        }
 
     def abort(self, rollout_id: int, reason: str) -> None:
         with self.sessions.begin() as s:

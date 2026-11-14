@@ -63,6 +63,7 @@ class RolloutSummary(BaseModel):
 
 class RolloutOut(RolloutSummary):
     policy: Policy
+    baseline: dict[str, float | None] | None
     events: list[EventOut]
 
 

@@ -29,11 +29,24 @@ class FakeRouter:
 
 
 class FakeMetrics:
+    """Readings per track. Both tracks start healthy with plenty of traffic."""
+
     def __init__(self):
-        self.readings: dict[str, float | None] = {"error_rate": 0.0}
+        self.readings: dict[str, dict[str, float | None]] = {
+            "canary": {"error_rate": 0.0, "p95_latency_ms": 50.0, "request_count": 1000},
+            "stable": {"error_rate": 0.0, "p95_latency_ms": 50.0, "request_count": 1000},
+        }
+
+    @property
+    def canary(self) -> dict[str, float | None]:
+        return self.readings["canary"]
+
+    @property
+    def stable(self) -> dict[str, float | None]:
+        return self.readings["stable"]
 
     def query(self, metric, app, track, window_seconds):
-        return self.readings.get(metric)
+        return self.readings[track].get(metric)
 
 
 class FakeClock:
@@ -84,10 +97,15 @@ def policy():
     return Policy(
         total_replicas=4,
         analysis_window_seconds=60,
+        min_requests=50,
+        max_wait_for_traffic_seconds=120,
         steps=[
             Step(weight=25, pause_seconds=60),
             Step(weight=50, pause_seconds=60),
             Step(weight=100, pause_seconds=60),
         ],
-        thresholds=[Threshold(metric="error_rate", max=0.05)],
+        thresholds=[
+            Threshold(metric="error_rate", max=0.05),
+            Threshold(metric="p95_latency_ms", max=500, max_over_stable=100),
+        ],
     )

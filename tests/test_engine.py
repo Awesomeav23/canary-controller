@@ -50,7 +50,7 @@ def test_bad_metrics_roll_back(engine, sessions, router, metrics, clock, policy)
     rid = create(sessions, policy)
     engine.tick()
 
-    metrics.readings["error_rate"] = 0.3
+    metrics.canary["error_rate"] = 0.3
     clock.advance(60)
     engine.tick()
 
@@ -65,10 +65,130 @@ def test_bad_metrics_roll_back(engine, sessions, router, metrics, clock, policy)
 def test_missing_metrics_roll_back(engine, sessions, metrics, clock, policy):
     rid = create(sessions, policy)
     engine.tick()
-    metrics.readings.clear()
+    metrics.canary["error_rate"] = None  # traffic is flowing, but the metric is missing
     clock.advance(60)
     engine.tick()
     assert get(sessions, rid).state == RolloutState.ROLLED_BACK
+
+
+# --- Week 3: compare against stable ---------------------------------------
+
+
+def test_canary_worse_than_stable_rolls_back_even_under_the_ceiling(
+    engine, sessions, router, metrics, clock, policy
+):
+    rid = create(sessions, policy)
+    engine.tick()
+
+    metrics.stable["p95_latency_ms"] = 80
+    metrics.canary["p95_latency_ms"] = 230  # under the 500 ms ceiling, but +150 vs stable
+    clock.advance(60)
+    engine.tick()
+
+    r = get(sessions, rid)
+    assert r.state == RolloutState.ROLLED_BACK
+    assert "p95_latency_ms=230 is +150 vs stable (80), allowed +100" in r.reason
+    assert router.calls[-1] == ("rollback", "demo", 4)
+
+
+def test_small_regression_within_allowance_passes(engine, sessions, metrics, clock, policy):
+    rid = create(sessions, policy)
+    engine.tick()
+    metrics.stable["p95_latency_ms"] = 80
+    metrics.canary["p95_latency_ms"] = 150  # +70, allowance is +100
+    clock.advance(60)
+    engine.tick()
+    assert get(sessions, rid).step_index == 1
+
+
+def test_final_step_compares_against_last_saved_baseline(engine, sessions, metrics, clock, policy):
+    rid = create(sessions, policy)
+    engine.tick()
+    metrics.stable["p95_latency_ms"] = 80
+    clock.advance(60)
+    engine.tick()  # step 0 -> 1, baseline saved
+    clock.advance(60)
+    engine.tick()  # step 1 -> 2 (100%)
+    assert get(sessions, rid).baseline["p95_latency_ms"] == 80
+
+    # At 100% stable has no pods, so no traffic and no readings.
+    metrics.readings["stable"] = {"request_count": 0}
+    metrics.canary["p95_latency_ms"] = 300  # +220 vs the saved baseline
+    clock.advance(60)
+    engine.tick()
+
+    r = get(sessions, rid)
+    assert r.state == RolloutState.ROLLED_BACK
+    assert "vs stable (80)" in r.reason
+
+
+def test_no_baseline_at_all_fails_closed(engine, sessions, metrics, clock, policy):
+    metrics.readings["stable"] = {"request_count": 0}
+    rid = create(sessions, policy)
+    engine.tick()
+    clock.advance(60)
+    engine.tick()
+
+    r = get(sessions, rid)
+    assert r.state == RolloutState.ROLLED_BACK
+    assert "no stable baseline" in r.reason
+
+
+def test_low_stable_traffic_is_not_trusted_as_baseline(engine, sessions, metrics, clock, policy):
+    metrics.stable.update(request_count=10, p95_latency_ms=5)  # too few requests to trust
+    rid = create(sessions, policy)
+    engine.tick()
+    clock.advance(60)
+    engine.tick()
+    assert "no stable baseline" in get(sessions, rid).reason
+
+
+# --- Week 3: minimum traffic ------------------------------------------------
+
+
+def test_waits_for_traffic_then_continues(engine, sessions, router, metrics, clock, policy):
+    rid = create(sessions, policy)
+    engine.tick()
+    metrics.canary["request_count"] = 12
+    clock.advance(60)
+    engine.tick()
+    engine.tick()
+
+    r = get(sessions, rid)
+    assert r.state == RolloutState.PROGRESSING and r.step_index == 0
+    assert [e.kind for e in r.events].count("waiting") == 1  # logged once, not every tick
+    assert "12 canary requests in 60s, need 50" in r.events[-1].message
+
+    metrics.canary["request_count"] = 400
+    clock.advance(30)
+    engine.tick()
+    assert get(sessions, rid).step_index == 1
+
+
+def test_never_enough_traffic_rolls_back(engine, sessions, router, metrics, clock, policy):
+    rid = create(sessions, policy)
+    engine.tick()
+    metrics.canary["request_count"] = 3
+
+    clock.advance(60 + 119)  # pause + just under max_wait_for_traffic_seconds
+    engine.tick()
+    assert get(sessions, rid).state == RolloutState.PROGRESSING
+
+    clock.advance(1)
+    engine.tick()
+    r = get(sessions, rid)
+    assert r.state == RolloutState.ROLLED_BACK
+    assert r.reason.startswith("insufficient traffic")
+    assert router.calls[-1] == ("rollback", "demo", 4)
+
+
+def test_no_traffic_data_counts_as_zero(engine, sessions, metrics, clock, policy):
+    rid = create(sessions, policy)
+    engine.tick()
+    metrics.canary["request_count"] = None
+    clock.advance(60)
+    engine.tick()
+    assert get(sessions, rid).events[-1].kind == "waiting"
 
 
 def test_freeze_holds_pending_rollout(engine, sessions, router, policy):

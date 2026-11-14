@@ -62,6 +62,8 @@ make demo-run                # terminal 3: the controller
 
 make rollout-good            # v2 walks 25% → 50% → 100% and is promoted
 make rollout-bad             # v2-bad (30% errors) is rolled back at the first step
+make rollout-slow            # v2-slow (+150 ms) is under the 500 ms ceiling, but slower
+                             # than stable, so it is rolled back too
 make status
 ```
 
@@ -84,6 +86,40 @@ FINAL: rolled_back - error_rate=0.3074 exceeds max 0.05
 ```
 
 The bad version only ever reached 1 of 4 pods, and was gone 65 seconds after it started.
+
+```text
+$ make rollout-slow
+[   2s] step         step 0: canary at 25%                                   | demo-stable=3 demo-canary=1
+[  63s] analysis     step 0 (25%): p95_latency_ms=242.5 is +237.8 vs stable (4.75), allowed +100
+[  63s] rolled_back  p95_latency_ms=242.5 is +237.8 vs stable (4.75), allowed +100
+```
+
+242 ms is well under the 500 ms ceiling, so a fixed-threshold check would have promoted
+it. It is caught only because it is compared against what's running now.
+
+## Rollout policy
+
+Each check can have a **hard ceiling** (`max`), a **limit relative to stable**
+(`max_over_stable`, in the metric's own units), or both:
+
+```yaml
+min_requests: 50                  # don't judge a canary on a handful of requests
+max_wait_for_traffic_seconds: 120 # wait this long for them, then roll back
+thresholds:
+  - { metric: error_rate, max: 0.05, max_over_stable: 0.01 }    # ≤5%, ≤1 point worse than stable
+  - { metric: p95_latency_ms, max: 500, max_over_stable: 100 }  # ≤500 ms, ≤100 ms slower
+```
+
+How a step is judged, once its pause is over:
+
+1. **Enough traffic?** Fewer than `min_requests` canary requests in the window: wait
+   (logged once), and roll back if traffic never arrives within
+   `max_wait_for_traffic_seconds`.
+2. **Baseline.** If stable also has enough traffic, its readings become the new baseline
+   and are saved on the rollout. If not (at the 100% step stable has no pods), the last
+   saved baseline is used.
+3. **Checks.** Every threshold must pass. Missing data, or no baseline for a
+   `max_over_stable` check, counts as a failure.
 
 ### What the first real run caught
 
@@ -129,6 +165,15 @@ measure should not be promoted.
   `SELECT … FOR UPDATE SKIP LOCKED`, so two controllers never work on the same rollout.
 - **Fails closed.** No metric data counts as unhealthy. A canary we can't see is not a
   canary we trust.
+- **Compared against stable, not just fixed limits.** A fixed limit has to be loose
+  enough for every app on its worst day, so it misses real regressions. Comparing with
+  the version running right now catches "worse than before" whatever the absolute level.
+  The ceiling stays as a backstop in case stable itself is unhealthy.
+- **Differences, not ratios.** `max_over_stable` is `canary - stable`. A ratio breaks when
+  stable is at 0 (any error at all is "infinitely worse"), and a 3 ms → 6 ms "100%
+  regression" doesn't matter to anyone.
+- **Low traffic means wait, not pass.** 0 errors out of 3 requests proves nothing.
+  Stable readings below `min_requests` are also ignored as a baseline.
 - **Traffic split = replica ratio.** Simple and needs no service mesh, but coarse:
   4 replicas only give 25% steps. See the roadmap for weighted routing.
 - **Failures are isolated.** An exception on one rollout is logged and rolled back
@@ -140,8 +185,8 @@ measure should not be promoted.
 - [x] **Week 2:** Run the full kind demo end to end (good rollout promoted, bad one
       rolled back); fixed two bugs it surfaced
 - [ ] **Week 2 polish:** Record a GIF of `make rollout-bad` for the top of this README
-- [ ] **Week 3:** Compare canary against stable instead of only fixed thresholds; add a
-      minimum request count before judging
+- [x] **Week 3:** Compare canary against stable (with a saved baseline for the 100%
+      step); wait for a minimum request count before judging; `make rollout-slow` demo
 - [ ] **Week 4:** Alembic migrations; Prometheus metrics for the controller itself
       (rollouts by outcome, time to rollback)
 - [ ] **Week 5:** Weighted traffic with Gateway API `HTTPRoute` for finer splits

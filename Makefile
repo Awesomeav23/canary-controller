@@ -6,7 +6,7 @@ TEST_DB := mysql+pymysql://canary:canary@127.0.0.1:3307/canary_test
 
 .PHONY: help up venv db-up db-down test test-mysql lint fmt run \
         cluster cluster-down images deploy prometheus-forward demo-run \
-        rollout-good rollout-bad status
+        rollout-good rollout-bad rollout-slow status db-reset
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-20s %s\n", $$1, $$2}'
@@ -23,6 +23,9 @@ db-up:  ## Start MySQL on :3307 and wait until healthy
 
 db-down:  ## Stop MySQL (keeps data)
 	docker compose down
+
+db-reset:  ## Wipe and recreate the dev database (no migrations yet, so needed after schema changes)
+	docker compose down -v && docker compose up -d --wait mysql
 
 test:  ## Run tests against in-memory SQLite
 	$(BIN)/pytest -q
@@ -46,11 +49,12 @@ cluster:  ## Create the kind cluster
 cluster-down:  ## Delete the kind cluster
 	kind delete cluster --name $(CLUSTER)
 
-images:  ## Build demo images (v1, v2 good, v2-bad 30% errors) and load into kind
+images:  ## Build demo images (v1, v2 good, v2-bad 30% errors, v2-slow +150ms) and load into kind
 	docker build -t demo-app:v1 --build-arg VERSION=v1 demo-app
 	docker build -t demo-app:v2 --build-arg VERSION=v2 demo-app
 	docker build -t demo-app:v2-bad --build-arg VERSION=v2-bad --build-arg ERROR_RATE=0.3 demo-app
-	kind load docker-image demo-app:v1 demo-app:v2 demo-app:v2-bad --name $(CLUSTER)
+	docker build -t demo-app:v2-slow --build-arg VERSION=v2-slow --build-arg EXTRA_LATENCY_MS=150 demo-app
+	kind load docker-image demo-app:v1 demo-app:v2 demo-app:v2-bad demo-app:v2-slow --name $(CLUSTER)
 
 deploy:  ## Apply demo app, load generator and Prometheus
 	kubectl apply -f deploy/k8s/
@@ -67,6 +71,9 @@ rollout-good:  ## Start a rollout that should succeed, and watch it (~3 min)
 
 rollout-bad:  ## Start a rollout that should auto-rollback, and watch it (~1 min)
 	$(BIN)/python scripts/watch_rollout.py demo-app:v2-bad demo $(API)
+
+rollout-slow:  ## Rollout under the 500ms ceiling but 150ms slower than stable: rolled back
+	$(BIN)/python scripts/watch_rollout.py demo-app:v2-slow demo $(API)
 
 status:  ## Show recent rollouts and pod split
 	curl -s '$(API)/rollouts?limit=5' | python3 -m json.tool

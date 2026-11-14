@@ -22,6 +22,10 @@ QUERIES = {
         "1000 * histogram_quantile(0.95, sum by (le) ("
         'rate(http_request_duration_seconds_bucket{{app="{app}",track="{track}"}}[{window}s])))'
     ),
+    # Not a health metric: used to check there is enough traffic to judge at all.
+    "request_count": (
+        'sum(increase(http_requests_total{{app="{app}",track="{track}"}}[{window}s]))'
+    ),
 }
 
 

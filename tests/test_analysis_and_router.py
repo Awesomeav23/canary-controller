@@ -37,3 +37,37 @@ def test_missing_data_fails_closed():
 )
 def test_split_replicas(weight, total, expected):
     assert split_replicas(weight, total) == expected
+
+
+# --- comparison against stable ---------------------------------------------
+
+RELATIVE = [Threshold(metric="p95_latency_ms", max_over_stable=100)]
+
+
+def test_within_allowance_vs_stable_is_healthy():
+    assert evaluate(RELATIVE, {"p95_latency_ms": 180}, {"p95_latency_ms": 100}).healthy
+
+
+def test_exactly_at_allowance_is_healthy():
+    assert evaluate(RELATIVE, {"p95_latency_ms": 200}, {"p95_latency_ms": 100}).healthy
+
+
+def test_over_allowance_vs_stable_is_unhealthy():
+    v = evaluate(RELATIVE, {"p95_latency_ms": 260}, {"p95_latency_ms": 100})
+    assert v.reasons == ("p95_latency_ms=260 is +160 vs stable (100), allowed +100",)
+
+
+def test_canary_better_than_stable_is_healthy():
+    assert evaluate(RELATIVE, {"p95_latency_ms": 20}, {"p95_latency_ms": 100}).healthy
+
+
+@pytest.mark.parametrize("stable", [None, {}, {"p95_latency_ms": None}])
+def test_no_baseline_fails_closed(stable):
+    v = evaluate(RELATIVE, {"p95_latency_ms": 20}, stable)
+    assert v.reasons == ("p95_latency_ms: no stable baseline to compare against",)
+
+
+def test_both_checks_report_separately():
+    both = [Threshold(metric="error_rate", max=0.05, max_over_stable=0.01)]
+    v = evaluate(both, {"error_rate": 0.2}, {"error_rate": 0.0})
+    assert len(v.reasons) == 2

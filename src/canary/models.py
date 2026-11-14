@@ -41,6 +41,9 @@ class Rollout(Base):
     state: Mapped[str] = mapped_column(String(20), default=RolloutState.PENDING, index=True)
     step_index: Mapped[int] = mapped_column(default=-1)
     step_started_at: Mapped[datetime | None] = mapped_column(Timestamp)
+    # Last stable readings with enough traffic to trust. At the 100% step stable has no
+    # pods, so the canary is compared against this instead.
+    baseline: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     # Holds the app name while the rollout is active and NULL once it finishes. The unique
     # index lets the database (not app code) guarantee one active rollout per app, even
     # when two API requests race.
