@@ -1,11 +1,15 @@
 # canary-controller
 
 A progressive delivery controller for Kubernetes. It rolls a new version out in steps
-(25% → 50% → 100%), checks the canary's error rate and latency in Prometheus after each
+(e.g. 5% → 25% → 50% → 100%), checks the canary's error rate and latency in Prometheus after each
 step, and **rolls back automatically** when a threshold is crossed.
 
 Built in Python (FastAPI + SQLAlchemy) with MySQL holding rollout state, so the
 controller can crash and pick up where it left off.
+
+**Running it yourself:** [docs/RUNNING.md](docs/RUNNING.md) is a step-by-step guide.
+It covers prerequisites, the three ways to run it, things to try, settings,
+troubleshooting and cleanup.
 
 ## Architecture
 
@@ -57,6 +61,8 @@ analyse. `promoting` waits for stable to run the new image before traffic moves 
 | `db.py`, `migrations/` | Connections, Alembic migrations, startup schema check |
 
 ## Quickstart (no cluster needed)
+
+The short version. [docs/RUNNING.md](docs/RUNNING.md) has the full walkthrough.
 
 ```bash
 make up        # venv + MySQL on :3307 + migrations

@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -167,12 +168,20 @@ def create_app(
     app.state.engine = engine
     app.state.dispatcher = dispatcher
 
-    def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+    # Declared as a security scheme, so /docs shows an "Authorize" button.
+    bearer = HTTPBearer(auto_error=False, description="CANARY_API_TOKEN")
+
+    def require_token(
+        creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+    ) -> None:
         if not settings.api_token:
             return
-        expected = f"Bearer {settings.api_token}"
-        if authorization is None or not secrets.compare_digest(authorization, expected):
-            raise HTTPException(401, "missing or invalid API token")
+        if creds is None or not secrets.compare_digest(
+            creds.credentials.encode(), settings.api_token.encode()
+        ):
+            raise HTTPException(
+                401, "missing or invalid API token", headers={"WWW-Authenticate": "Bearer"}
+            )
 
     Write = [Depends(require_token)]
 
