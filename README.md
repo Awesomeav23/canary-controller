@@ -15,21 +15,33 @@ flowchart LR
     api --> db[(MySQL<br/>rollouts, events, freezes)]
     loop[Rollout loop<br/>tick every 5s] --> db
     loop -->|query canary metrics| prom[Prometheus]
-    loop -->|patch replicas / image| k8s[Kubernetes API]
-    k8s --> stable[demo-stable]
-    k8s --> canary[demo-canary]
-    svc[Service: demo] --> stable & canary
+    loop -->|patch route weights,<br/>replicas, image| k8s[Kubernetes API]
+    users[Traffic] --> gw[Envoy Gateway]
+    gw -->|HTTPRoute: 100-x %| stable[demo-stable]
+    gw -->|HTTPRoute: x %| canary[demo-canary]
+    k8s -.-> gw & stable & canary
     prom -. scrapes .-> stable & canary
 ```
+
+Two routing modes (`CANARY_ROUTER`):
+
+| Mode | How traffic is split | Smallest step | Rollback |
+|---|---|---|---|
+| `gateway` | Gateway API `HTTPRoute` weights | any % (e.g. 5%) | instant route flip; stable never scaled down |
+| `replicas` | pod ratio behind one Service | 1 pod (25% with 4 pods) | stable scales back up |
+| `log` | nothing; logs actions | n/a | n/a |
 
 **State machine** (`src/canary/engine.py`):
 
 ```
-pending ──(no freeze)──> progressing ──(every step healthy)──> succeeded
+pending ──(no freeze)──> progressing ──(every step healthy)──> promoting ──> succeeded
                               │
-                              └──(a step fails analysis)──> rolled_back
+                              └──(a step fails, or pods never ready)──> rolled_back
 pending / progressing ──(abort API)──> aborted
 ```
+
+Each step: **wait for canary pods** → move traffic → pause → check traffic volume →
+analyse. `promoting` waits for stable to run the new image before traffic moves back.
 
 | Module | Responsibility |
 |---|---|
@@ -37,7 +49,7 @@ pending / progressing ──(abort API)──> aborted
 | `engine.py` | State machine: one transition per tick, persisted in MySQL |
 | `analysis.py` | Pure function: metric readings + thresholds → verdict |
 | `metrics.py` | PromQL queries for canary error rate and p95 latency |
-| `router.py` | Traffic shifting: replica split between stable and canary Deployments |
+| `router.py` | Traffic shifting: `GatewayRouter` (route weights) or `ReplicaRouter` (pod ratio) |
 | `api.py` | REST API and the background loop |
 | `telemetry.py` | Prometheus metrics about the controller itself |
 | `db.py`, `migrations/` | Connections, Alembic migrations, startup schema check |
@@ -98,6 +110,44 @@ $ make rollout-slow
 
 242 ms is well under the 500 ms ceiling, so a fixed-threshold check would have promoted
 it. It is caught only because it is compared against what's running now.
+
+### Weighted routing (Gateway API)
+
+```bash
+make gateway-install     # Envoy Gateway v1.9.3 into the kind cluster
+make gateway-deploy      # Gateway + HTTPRoute; load generator goes through Envoy
+make demo-run-gateway    # controller with CANARY_ROUTER=gateway
+
+make rollout-gateway-bad   # caught at 5% of traffic
+make rollout-gateway-good  # 5% -> 25% -> 50% -> 100%, promoted
+```
+
+Real output (`| deployments | route weights`):
+
+```text
+$ make rollout-gateway-bad
+[   4s] waiting_for_pods step 0: canary pods starting (5% next)  | stable=4 canary=1 | route stable:100 canary:0
+[   8s] step         step 0: canary at 5%                        | stable=4 canary=1 | route stable:95 canary:5
+[  69s] analysis     step 0 (5%): error_rate=0.3222 exceeds max 0.05 ...
+[  69s] rolled_back  ...                                         | stable=4 canary=0 | route stable:100 canary:0
+
+$ make rollout-gateway-good
+[  10s] step         step 0: canary at 5%      | stable=4 canary=1 | route stable:95 canary:5
+[  71s] step         step 1: canary at 25%     | stable=4 canary=1 | route stable:75 canary:25
+[ 131s] waiting_for_pods step 2: canary pods starting (50% next)
+[ 137s] step         step 2: canary at 50%     | stable=4 canary=2 | route stable:50 canary:50
+[ 202s] step         step 3: canary at 100%    | stable=4 canary=4 | route stable:0 canary:100
+[ 261s] succeeded    all steps healthy         | stable=4 canary=0 | route stable:100 canary:0
+```
+
+- **The 5% is real.** Measured in Prometheus at the moment of analysis, the canary got
+  4.92–5.13% of requests (60/45/30 s windows), not just 5 in a config field.
+- **Stable stays at 4 pods throughout**, so rollback is one route change. In replica mode,
+  rolling back at 100% has to wait for stable pods to start again.
+- **Traffic never gets ahead of capacity.** Before 50%, the controller waited 6 s for a
+  second canary pod instead of sending half the users to one.
+- **Promotion is a real state.** Rolling `v2 -> v1` live: the canary kept 100% of traffic
+  while stable rolled 4 pods to `v1` (5 s), and only then did the route flip back.
 
 ## Rollout policy
 
@@ -236,8 +286,22 @@ make migration m="add foo column"  # draft a new one from model changes, then re
   regression" doesn't matter to anyone.
 - **Low traffic means wait, not pass.** 0 errors out of 3 requests proves nothing.
   Stable readings below `min_requests` are also ignored as a baseline.
-- **Traffic split = replica ratio.** Simple and needs no service mesh, but coarse:
-  4 replicas only give 25% steps. See the roadmap for weighted routing.
+- **Two routers behind one interface.** `replicas` needs nothing but Kubernetes, but its
+  smallest step is one pod. `gateway` splits by exact weight but needs a Gateway API
+  implementation. The engine doesn't know which it has.
+- **Never route users to pods that can't serve.** `set_weight` and `promote` return
+  "not yet" until the target pods are ready, and the engine retries next tick. A step's
+  pause counts from when traffic actually moved (`traffic_shifted_at`), not from when
+  the step began. Pods that never get ready (bad image, crash loop) roll back after
+  `pod_ready_timeout_seconds`.
+- **Trade-off: rollback speed vs. cost.** Gateway mode keeps stable at full size during
+  the whole rollout. That costs extra pods (up to 2x at the 100% step), and in return
+  rollback never waits for pods to start.
+- **Abort is refused while promoting.** By then stable is partway through rolling to the
+  verified image. "Rolling back" would be a third version change, not a safe stop.
+- **Blind spot.** Analysis uses the app's own metrics, so errors produced by Envoy itself
+  (e.g. 503 with no healthy upstream) aren't counted. Next step: also read Envoy's
+  per-backend metrics.
 - **Failures are isolated.** An exception on one rollout is logged and rolled back
   without stalling the others (`test_one_failing_rollout_does_not_block_others`).
 
@@ -251,7 +315,8 @@ make migration m="add foo column"  # draft a new one from model changes, then re
       step); wait for a minimum request count before judging; `make rollout-slow` demo
 - [x] **Week 4:** Alembic migrations (schema checked in CI, startup schema check);
       Prometheus metrics for the controller itself (outcomes, time to rollback)
-- [ ] **Week 5:** Weighted traffic with Gateway API `HTTPRoute` for finer splits
+- [x] **Week 5:** Weighted traffic with Gateway API `HTTPRoute` (Envoy Gateway): 5%
+      steps, instant rollback, waits for pod readiness, `promoting` state
 - [ ] **Week 6:** Slack/webhook notifications; a GitHub Action that starts a rollout after
       merge
 - [ ] **Stretch:** LLM summary of why a rollout failed (metrics + recent log lines),

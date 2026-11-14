@@ -10,7 +10,7 @@ import time
 import httpx
 import yaml
 
-ACTIVE = {"pending", "progressing"}
+ACTIVE = {"pending", "progressing", "promoting"}
 
 
 def replica_split(app: str) -> str:
