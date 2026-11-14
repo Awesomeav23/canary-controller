@@ -11,6 +11,50 @@ There are three ways to run it. Each builds on the one before:
 | **B. Cluster, pod-ratio routing** | Real rollouts on Kubernetes (25% steps) | + kind, kubectl | 10 min |
 | **C. Cluster, weighted routing** | 5% steps through Envoy Gateway | + B | +5 min |
 
+## What runs where
+
+B and C use **real Kubernetes**: [kind](https://kind.sigs.k8s.io/) runs a full cluster
+inside Docker on your machine. Nothing is simulated.
+
+```text
+your machine                                   kind cluster "canary" (in Docker)
+─────────────────────────────                  ─────────────────────────────────────────
+controller (uvicorn, :8020) ── kubeconfig ───▶ Kubernetes API
+   │                                             ├─ Deployment demo-stable (4 pods)
+   │                                             ├─ Deployment demo-canary (0..4 pods)
+   │                                             ├─ Services demo, demo-stable, demo-canary
+   │                                             ├─ Envoy Gateway + HTTPRoute "demo"   (C)
+   │                                             ├─ loadgen (steady traffic)
+   └── port-forward :9095 ──────────────────────▶ Prometheus (finds pods via the K8s API)
+MySQL (Docker, :3307)
+```
+
+**In the cluster:**
+- The demo app runs as two Deployments with Services, readiness probes and rolling
+  updates.
+- Prometheus scrapes the pods it discovers through the Kubernetes API.
+- In C, Envoy Gateway splits traffic using a Gateway API `HTTPRoute`.
+
+**The controller changes the cluster through the real Kubernetes API:** it scales
+Deployments, changes their image, edits the route's weights, and waits for pods to be
+ready before moving traffic.
+
+**Not in the cluster (yet):** the controller itself runs on your machine. It reaches
+the cluster through your kubeconfig and Prometheus through the port-forward. To run it
+as a pod it would need:
+
+- a container image for the controller
+- a Deployment and a ServiceAccount
+- RBAC to patch Deployments and `HTTPRoute`s
+- a Job that runs `alembic upgrade head` before each release
+
+The code is ready for this part: it already uses the in-cluster config when it finds
+one (`src/canary/router.py`). The manifests don't exist yet. See the README roadmap.
+
+**Not done: a cloud cluster.** Running on AWS (EKS, with RDS for MySQL) is an optional
+roadmap item. It costs money and needs an AWS account. Nothing in the code is specific
+to kind, but it hasn't been tried on a cloud cluster.
+
 ## Prerequisites
 
 | Tool | Check | Install (macOS) |

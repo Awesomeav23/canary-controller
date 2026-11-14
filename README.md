@@ -421,4 +421,7 @@ make migration m="add foo column"  # draft a new one from model changes, then re
       `canary-rollout` CLI + GitHub Action, tested end to end in CI
 - [ ] **Stretch:** LLM summary of why a rollout failed (metrics + recent log lines),
       added to the rollback event
-- [ ] **Stretch:** Deploy the controller itself to EKS with RDS MySQL
+- [ ] **Next:** Run the controller itself in the cluster: container image, Deployment,
+      ServiceAccount + RBAC (patch Deployments and HTTPRoutes), migration Job. Today it
+      runs on the host against kind ([what runs where](docs/RUNNING.md#what-runs-where))
+- [ ] **Stretch:** Deploy to a cloud cluster: EKS with RDS MySQL
