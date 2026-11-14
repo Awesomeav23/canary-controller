@@ -129,3 +129,34 @@ def test_traffic_shifted_at_backfill(blank_db):
         rows = dict(conn.execute(text("SELECT app, traffic_shifted_at FROM rollouts")).all())
     assert str(rows["mid"]).startswith("2026-01-01 10:00:00")
     assert rows["new"] is None
+
+
+def test_migrations_found_without_alembic_ini(tmp_path, monkeypatch):
+    # The container image has the package installed but no repo checkout around it.
+    expected = head_revision()
+    monkeypatch.setattr("canary.db.REPO_ROOT", tmp_path)
+    assert head_revision() == expected
+
+
+@pytest.mark.skipif(
+    "mysql" not in (os.getenv("CANARY_TEST_DATABASE_URL") or ""), reason="MySQL named lock"
+)
+def test_concurrent_migrations_are_serialized(blank_db):
+    # Two pods starting at once both run `alembic upgrade head`. Without the lock the
+    # second fails half-way with "Duplicate column" and leaves the schema between versions.
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "CANARY_DATABASE_URL": os.environ["CANARY_TEST_DATABASE_URL"]}
+    alembic = [sys.executable, "-m", "alembic", "upgrade", "head"]
+    procs = [
+        subprocess.Popen(alembic, cwd=root, env=env, stderr=subprocess.PIPE, text=True)
+        for _ in range(3)
+    ]
+    for p in procs:
+        assert p.wait(timeout=120) == 0, p.stderr.read()
+    engine = blank_db.kw["bind"]
+    assert current_revision(engine) == head_revision()
+    assert schema_diff(engine) == []

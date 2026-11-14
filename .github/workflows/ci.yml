@@ -112,8 +112,52 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: pytest -q
 
+  # The whole thing on a fresh kind cluster: demo app, Prometheus, and the controller
+  # running as a pod with its own MySQL. One bad release must roll back on real error
+  # metrics (not "no data"), and one good release must be promoted.
+  kind-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e .
+      - run: make cluster
+      - run: make images
+      - run: make deploy
+      - run: make incluster-deploy
+      - name: Forward the controller
+        run: |
+          nohup make incluster-forward > forward.log 2>&1 &
+          for _ in $(seq 30); do curl -sf localhost:8020/healthz && exit 0; sleep 1; done
+          cat forward.log; exit 1
+      - name: Bad release is rolled back on its error rate
+        run: |
+          CANARY_API_TOKEN=$(make -s incluster-token)
+          export CANARY_API_TOKEN
+          set +e
+          canary-rollout --api http://localhost:8020 --app demo --image demo-app:v2-bad --timeout 600
+          code=$?
+          set -e
+          test "$code" = 1
+          curl -s 'localhost:8020/rollouts?limit=1' | grep -q 'error_rate='
+      - name: Good release is promoted
+        run: |
+          CANARY_API_TOKEN=$(make -s incluster-token)
+          export CANARY_API_TOKEN
+          canary-rollout --api http://localhost:8020 --app demo --image demo-app:v2 --timeout 900
+          kubectl get deploy demo-stable -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            | grep -qx demo-app:v2
+      - if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl logs deploy/canary-controller --all-containers --tail=200
+          cat forward.log
+
   demo-image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t demo-app:ci demo-app
+      - run: docker build -t canary-controller:ci .

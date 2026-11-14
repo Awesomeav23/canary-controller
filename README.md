@@ -157,6 +157,33 @@ $ make rollout-gateway-good
 - **Promotion is a real state.** Rolling `v2 -> v1` live: the canary kept 100% of traffic
   while stable rolled 4 pods to `v1` (5 s), and only then did the route flip back.
 
+### The controller as a pod
+
+The controller can also run inside the cluster, next to the app it rolls out:
+
+```bash
+make incluster-deploy ROUTER=gateway   # image, MySQL pod, RBAC, controller (~1 min)
+make incluster-forward                 # API on :8020 (leave running)
+export CANARY_API_TOKEN=$(make -s incluster-token)
+make rollout-gateway-bad
+```
+
+- **Least privilege.** A namespaced `Role`: read Deployment status, patch Deployments
+  and `HTTPRoute`s. Nothing else.
+- **Migrations in an init container.** The controller still refuses to start on an old
+  schema; the init container runs `alembic upgrade head` first.
+- **Restart-safe.** Killing the controller pod at step 1 of a 4-step rollout: the new pod
+  picked it up at the same step and promoted it.
+- **Tested from scratch in CI.** The `kind-e2e` job builds a fresh kind cluster per push,
+  deploys everything, and checks a bad release is rolled back on its real error rate and a
+  good one is promoted.
+
+The first in-cluster run found a real bug: two controller pods started together, both
+ran migrations, and MySQL (whose DDL isn't transactional) failed the second half-way with
+`Duplicate column`, leaving the schema between versions. Migrations now take a MySQL
+named lock (`GET_LOCK`), so concurrent runs wait their turn. A test starts three
+`alembic upgrade` processes at once; it fails without the lock.
+
 ## Rollout policy
 
 Each check can have a **hard ceiling** (`max`), a **limit relative to stable**
@@ -297,6 +324,10 @@ there, so the controller must fail closed. The job checks that the Action report
 `rolled_back`, fails its step, and that writes without the token get 401. `actionlint`
 checks every workflow, including inputs passed to the local Action.
 
+The `kind-e2e` job goes further: a fresh kind cluster, the demo app, Prometheus and the
+controller as a pod. `canary-rollout` must exit 1 for `v2-bad` (rolled back on
+`error_rate`, not on missing data) and 0 for `v2` (stable now runs `v2`).
+
 ## Controller metrics
 
 The controller is itself a production service, so it reports on itself at `/metrics`:
@@ -336,6 +367,8 @@ Schema changes ship as Alembic migrations in `src/canary/migrations/versions/`:
 | `0001` | Initial schema: rollouts, event log, deploy freezes |
 | `0002` | `rollouts.baseline`: last trusted stable readings (Week 3) |
 | `0003` | `rollouts.started_at`, backfilled from each rollout's first `step` event (Week 4) |
+| `0004` | `rollouts.traffic_shifted_at`: pauses count from when traffic moved (Week 5) |
+| `0005` | `notifications` outbox table (Week 6) |
 
 ```bash
 make migrate                       # apply everything
@@ -345,8 +378,11 @@ make migration m="add foo column"  # draft a new one from model changes, then re
 - **The app checks the schema but never migrates it.** On startup it compares the
   database's revision with the code's and refuses to start if they differ
   (`database schema is at 0002, code expects 0003: run make migrate`). Migrating on startup
-  would let several replicas race to run the same migration. In production this would run
-  as a separate deploy step, such as a Kubernetes Job.
+  would let several replicas race to run the same migration. In the cluster an init
+  container runs them before the controller starts.
+- **Concurrent runs are serialized.** MySQL can't roll back DDL, so two runners at once
+  could leave a half-applied migration. `migrations/env.py` takes a MySQL named lock first;
+  the second runner waits, then finds nothing to do.
 - **Additive changes first.** `0002` and `0003` only add nullable columns, so the old code
   keeps working while the migration runs. Old and new versions run side by side during a
   rollout, which this controller of all things should respect.
@@ -421,7 +457,7 @@ make migration m="add foo column"  # draft a new one from model changes, then re
       `canary-rollout` CLI + GitHub Action, tested end to end in CI
 - [ ] **Stretch:** LLM summary of why a rollout failed (metrics + recent log lines),
       added to the rollback event
-- [ ] **Next:** Run the controller itself in the cluster: container image, Deployment,
-      ServiceAccount + RBAC (patch Deployments and HTTPRoutes), migration Job. Today it
-      runs on the host against kind ([what runs where](docs/RUNNING.md#what-runs-where))
+- [x] **In the cluster:** The controller as a pod: container image, Deployment with a
+      migration init container, least-privilege RBAC, MySQL in the cluster; serialized
+      migrations; a fresh-cluster end-to-end job in CI
 - [ ] **Stretch:** Deploy to a cloud cluster: EKS with RDS MySQL

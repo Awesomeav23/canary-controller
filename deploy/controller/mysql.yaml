@@ -1,0 +1,55 @@
+# MySQL inside the cluster, for the in-cluster controller. Local demo credentials, the
+# same as docker-compose.yml. On a real cluster this would be a managed database.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: canary-mysql
+stringData:
+  password: canary
+  url: mysql+pymysql://canary:canary@canary-mysql:3306/canary
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: canary-mysql
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-mysql
+spec:
+  replicas: 1
+  strategy: { type: Recreate }  # one pod owns the volume at a time
+  selector: { matchLabels: { app: canary-mysql } }
+  template:
+    metadata:
+      labels: { app: canary-mysql }
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          env:
+            - { name: MYSQL_DATABASE, value: canary }
+            - { name: MYSQL_USER, value: canary }
+            - name: MYSQL_PASSWORD
+              valueFrom: { secretKeyRef: { name: canary-mysql, key: password } }
+            - { name: MYSQL_RANDOM_ROOT_PASSWORD, value: "yes" }
+          ports: [{ containerPort: 3306 }]
+          readinessProbe:
+            exec: { command: [sh, -c, "mysqladmin ping -h 127.0.0.1 -ucanary -p$MYSQL_PASSWORD"] }
+            periodSeconds: 3
+          volumeMounts: [{ name: data, mountPath: /var/lib/mysql }]
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: canary-mysql }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-mysql
+spec:
+  selector: { app: canary-mysql }
+  ports: [{ port: 3306, targetPort: 3306 }]

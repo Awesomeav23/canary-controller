@@ -7,7 +7,8 @@ TEST_DB := mysql+pymysql://canary:canary@127.0.0.1:3307/canary_test
 .PHONY: help up venv db-up db-down test test-mysql lint fmt run \
         cluster cluster-down images deploy prometheus-forward demo-run \
         rollout-good rollout-bad rollout-slow status db-reset migrate migration \
-        gateway-install gateway-deploy demo-run-gateway rollout-gateway-good rollout-gateway-bad
+        gateway-install gateway-deploy demo-run-gateway rollout-gateway-good rollout-gateway-bad \
+        incluster-deploy incluster-forward incluster-token incluster-logs incluster-down
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-20s %s\n", $$1, $$2}'
@@ -111,3 +112,31 @@ rollout-gateway-bad:  ## Bad release caught at 5% of traffic, not 25%
 status:  ## Show recent rollouts and pod split
 	curl -s '$(API)/rollouts?limit=5' | python3 -m json.tool
 	-kubectl get deploy demo-stable demo-canary
+
+# --- the controller itself in the cluster -------------------------------------
+ROUTER ?= replicas
+
+incluster-deploy:  ## Run the controller + its MySQL as pods: make incluster-deploy [ROUTER=gateway]
+	docker build -t canary-controller:dev .
+	kind load docker-image canary-controller:dev --name $(CLUSTER)
+	kubectl get secret canary-controller-token >/dev/null 2>&1 || \
+	  kubectl create secret generic canary-controller-token --from-literal=token=$$(openssl rand -hex 16)
+	kubectl apply -f deploy/controller/mysql.yaml
+	sed -e 's|CANARY_ROUTER, value: replicas|CANARY_ROUTER, value: $(ROUTER)|' \
+	    -e "s|canary/image-id: dev|canary/image-id: \"$$(docker image inspect -f '{{.Id}}' canary-controller:dev | cut -c8-19)\"|" \
+	    deploy/controller/controller.yaml | kubectl apply -f -
+	kubectl rollout status deploy/canary-mysql deploy/canary-controller --timeout=5m
+
+incluster-forward:  ## Expose the in-cluster controller on :8020 (stop any local one first)
+	@# port-forward exits when its pod goes away (restart, redeploy), so reconnect.
+	while true; do kubectl port-forward svc/canary-controller 8020:8020; sleep 2; done
+
+incluster-token:  ## Print the in-cluster controller's API token
+	@kubectl get secret canary-controller-token -o jsonpath='{.data.token}' | base64 -d; echo
+
+incluster-logs:  ## Follow the in-cluster controller's logs
+	kubectl logs -f deploy/canary-controller
+
+incluster-down:  ## Remove the in-cluster controller and its MySQL (and its data)
+	kubectl delete -f deploy/controller/ --ignore-not-found
+	kubectl delete secret canary-controller-token --ignore-not-found

@@ -3,13 +3,14 @@
 A step-by-step guide to running and trying the project on your machine. For what it does
 and why, see the [README](../README.md).
 
-There are three ways to run it. Each builds on the one before:
+There are four ways to run it. Each builds on the one before:
 
 | | What you get | Needs | Time |
 |---|---|---|---|
 | **A. API only** | The API, database and tests. No real rollouts | Python, Docker | 2 min |
 | **B. Cluster, pod-ratio routing** | Real rollouts on Kubernetes (25% steps) | + kind, kubectl | 10 min |
 | **C. Cluster, weighted routing** | 5% steps through Envoy Gateway | + B | +5 min |
+| **D. Controller in the cluster** | The controller as a pod, with its own MySQL | + B (C optional) | +3 min |
 
 ## What runs where
 
@@ -39,17 +40,18 @@ MySQL (Docker, :3307)
 Deployments, changes their image, edits the route's weights, and waits for pods to be
 ready before moving traffic.
 
-**Not in the cluster (yet):** the controller itself runs on your machine. It reaches
-the cluster through your kubeconfig and Prometheus through the port-forward. To run it
-as a pod it would need:
+**Where the controller runs:** in B and C it runs on your machine, reaching the cluster
+through your kubeconfig and Prometheus through the port-forward. That's handy while
+changing code. In D it runs as a pod in the cluster instead:
 
-- a container image for the controller
-- a Deployment and a ServiceAccount
-- RBAC to patch Deployments and `HTTPRoute`s
-- a Job that runs `alembic upgrade head` before each release
-
-The code is ready for this part: it already uses the in-cluster config when it finds
-one (`src/canary/router.py`). The manifests don't exist yet. See the README roadmap.
+```text
+kind cluster "canary"
+  canary-controller (pod) ── ServiceAccount + Role ──▶ Kubernetes API
+       │   init container: alembic upgrade head
+       ├──▶ canary-mysql (pod + volume)
+       └──▶ prometheus:9090
+your machine: make incluster-forward ──▶ :8020
+```
 
 **Not done: a cloud cluster.** Running on AWS (EKS, with RDS for MySQL) is an optional
 roadmap item. It costs money and needs an AWS account. Nothing in the code is specific
@@ -64,12 +66,15 @@ to kind, but it hasn't been tried on a cloud cluster.
 | kind (B, C) | `kind version` | `brew install kind` |
 | kubectl (B, C) | `kubectl version --client` | `brew install kubectl` |
 
+Works on macOS and Linux. On Windows, use WSL2 (the Makefile needs a Unix shell) with
+Docker Desktop's WSL integration turned on, and run everything inside WSL.
+
 Ports used on your machine:
 
 | Port | What |
 |---|---|
 | 3307 | MySQL (Docker) |
-| 8020 | The controller's API |
+| 8020 | The controller's API (in D, the port-forward to it) |
 | 9095 | Prometheus (port-forward from the cluster) |
 | 8090 | Optional local webhook receiver (for notifications) |
 
@@ -83,7 +88,7 @@ Ports used on your machine:
 git clone https://github.com/Awesomeav23/canary-controller.git
 cd canary-controller
 make up          # .venv, MySQL on :3307, database migrations
-make test        # 112 tests on SQLite, ~1 s; all should pass
+make test        # 114 tests on SQLite, ~1 s (1 MySQL-only test skipped)
 make test-mysql  # the same tests on real MySQL
 make run         # API on http://127.0.0.1:8020 (leave running)
 ```
@@ -185,6 +190,54 @@ kubectl set env deploy/loadgen TARGET=http://demo/
 
 (`make deploy` also resets it, because it re-applies `deploy/k8s/loadgen.yaml`. So run
 `make gateway-deploy` again if you then go back to gateway mode.)
+
+---
+
+## D. The controller in the cluster
+
+Do B first (C too, if you want weighted routing). Then stop the controller in terminal 3
+(Ctrl-C): the in-cluster one takes over port 8020.
+
+**Terminal 1**
+
+```bash
+make incluster-deploy                  # pod-ratio routing, like B
+# or
+make incluster-deploy ROUTER=gateway   # weighted routing, like C
+```
+
+This builds the controller image, loads it into kind, creates an API token, and starts
+MySQL and the controller as pods. Check: `kubectl get pods` shows `canary-controller-…`
+and `canary-mysql-…` both `Running`.
+
+**Terminal 3** (leave running)
+
+```bash
+make incluster-forward        # the in-cluster API on :8020; reconnects if the pod restarts
+```
+
+**Terminal 1**
+
+```bash
+export CANARY_API_TOKEN=$(make -s incluster-token)   # this one always has a token
+make rollout-bad              # with ROUTER=replicas
+make rollout-gateway-bad      # with ROUTER=gateway
+make incluster-logs           # the controller's logs (Ctrl-C to stop)
+```
+
+The output looks the same as in B or C. Prometheus (terminal 2) is now only needed for
+you: the controller reaches it inside the cluster.
+
+Things to try:
+- **Restart mid-rollout:** start `make rollout-gateway-good`, and after the first step run
+  `kubectl delete pod -l app=canary-controller`. The watcher may lose the connection, but
+  the new pod carries on from the same step: check with `make status`.
+- **Switch routing:** `make incluster-deploy ROUTER=gateway` again; only the controller
+  restarts. The [load generator](#switching-back-to-pod-ratio-mode) must match the mode.
+- **Change the code:** edit, then `make incluster-deploy` rebuilds and rolls the pod.
+
+Back to running it on your machine: `make incluster-down`, then `make demo-run` (or
+`demo-run-gateway`). The two use separate databases, so each has its own rollout history.
 
 ---
 
@@ -317,13 +370,16 @@ Rollout steps and thresholds live in `policies/*.yaml`. The README's
 | `make gateway-deploy` hangs on `Programmed` | Envoy Gateway not installed or still starting | `make gateway-install`, then retry |
 | `Bind for 0.0.0.0:3307 failed` | Something else uses port 3307 | Change the port in `docker-compose.yml` and set `CANARY_DATABASE_URL` to match |
 | kubectl talks to the wrong cluster | Context isn't kind's | `kubectl config use-context kind-canary` |
+| `make incluster-forward`: `address already in use` | The local controller still runs on 8020 | Ctrl-C it (terminal 3) |
+| D: `kubectl get pods` shows `Init:` for a while | The init container waits for MySQL, then migrates | Normal for up to a minute. `kubectl logs deploy/canary-controller -c migrate` |
 
 ---
 
 ## Cleaning up
 
 ```bash
-# Ctrl-C the controller, the port-forward and the receiver, then:
+# Ctrl-C the controller, the port-forwards and the receiver, then:
+make incluster-down  # only if you did D: controller + its MySQL and data
 make cluster-down    # deletes the kind cluster (and Envoy Gateway in it)
 make db-down         # stops MySQL, keeps its data
 docker compose down -v   # stops MySQL and deletes its data

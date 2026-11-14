@@ -27,7 +27,12 @@ def make_sessionmaker(url: str) -> sessionmaker:
 
 
 def alembic_config() -> Config:
-    return Config(str(REPO_ROOT / "alembic.ini"))
+    # alembic.ini only exists in a checkout; an installed package (the container image)
+    # still finds its migrations by package name.
+    ini = REPO_ROOT / "alembic.ini"
+    cfg = Config(str(ini)) if ini.exists() else Config()
+    cfg.set_main_option("script_location", "canary:migrations")
+    return cfg
 
 
 def head_revision() -> str:

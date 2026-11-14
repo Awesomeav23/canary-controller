@@ -1,0 +1,90 @@
+# The controller as a pod. `make incluster-deploy` builds the image, creates the API token
+# Secret (canary-controller-token), sets the router and image ID below, and applies this.
+#
+# RBAC is a namespaced Role with only what src/canary/router.py calls:
+#   Deployments: read status, patch replicas/image. HTTPRoutes: patch weights.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: canary-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: canary-controller
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, patch]
+  - apiGroups: [apps]
+    resources: [deployments/status]
+    verbs: [get]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: canary-controller
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: canary-controller }
+subjects: [{ kind: ServiceAccount, name: canary-controller }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-controller
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: canary-controller } }
+  template:
+    metadata:
+      labels: { app: canary-controller }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8020"
+        # `make incluster-deploy` fills in the image ID, so a rebuilt :dev image rolls the pod.
+        canary/image-id: dev
+    spec:
+      serviceAccountName: canary-controller
+      initContainers:
+        # Migrations run before the controller starts, which refuses to run on an old
+        # schema. Retries while MySQL is still starting. Fine with one replica; with more,
+        # a separate Job per release would avoid concurrent migrations.
+        - name: migrate
+          image: canary-controller:dev
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - for i in $(seq 60); do alembic upgrade head && exit 0; sleep 3; done; exit 1
+          env:
+            - name: CANARY_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: canary-mysql, key: url } }
+      containers:
+        - name: controller
+          image: canary-controller:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: CANARY_ROUTER, value: replicas }  # or gateway: make incluster-deploy ROUTER=gateway
+            - { name: CANARY_PROMETHEUS_URL, value: "http://prometheus:9090" }
+            - name: CANARY_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: CANARY_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: canary-mysql, key: url } }
+            - name: CANARY_API_TOKEN
+              valueFrom: { secretKeyRef: { name: canary-controller-token, key: token } }
+          ports: [{ containerPort: 8020 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8020 }, periodSeconds: 3 }
+          livenessProbe: { httpGet: { path: /healthz, port: 8020 }, periodSeconds: 10 }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-controller
+spec:
+  selector: { app: canary-controller }
+  ports: [{ port: 8020, targetPort: 8020 }]

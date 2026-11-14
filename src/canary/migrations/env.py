@@ -19,11 +19,30 @@ def _configure(**kwargs) -> None:
     context.configure(target_metadata=target_metadata, compare_type=True, **kwargs)
 
 
+MIGRATION_LOCK = "canary_migrations"
+LOCK_TIMEOUT_SECONDS = 300
+
+
 def _run(connection: Connection) -> None:
     # SQLite can't ALTER most things in place; batch mode rebuilds the table instead.
     _configure(connection=connection, render_as_batch=connection.dialect.name == "sqlite")
-    with context.begin_transaction():
-        context.run_migrations()
+    if connection.dialect.name != "mysql":
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+    # MySQL DDL isn't transactional, so two runners at once (two pods starting together)
+    # both apply the same ALTER and the second fails half-way. A named lock serializes
+    # them: the second waits, then reads the new version and has nothing to do.
+    got = connection.exec_driver_sql(
+        f"SELECT GET_LOCK('{MIGRATION_LOCK}', {LOCK_TIMEOUT_SECONDS})"
+    ).scalar()
+    if got != 1:
+        raise RuntimeError(f"another migration still holds {MIGRATION_LOCK!r}")
+    try:
+        with context.begin_transaction():
+            context.run_migrations()
+    finally:
+        connection.exec_driver_sql(f"SELECT RELEASE_LOCK('{MIGRATION_LOCK}')")
 
 
 if context.is_offline_mode():
