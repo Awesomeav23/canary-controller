@@ -8,13 +8,14 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from canary.config import Settings
-from canary.db import init_db, make_sessionmaker
+from canary.db import make_sessionmaker, require_schema_current
 from canary.engine import Engine, RolloutFinishedError
 from canary.metrics import MetricsSource, PrometheusMetrics
 from canary.models import DeployFreeze, Rollout, RolloutEvent
@@ -58,6 +59,7 @@ class RolloutSummary(BaseModel):
     current_weight: int
     reason: str | None
     created_at: datetime
+    started_at: datetime | None
     updated_at: datetime
 
 
@@ -110,7 +112,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        init_db(sessions)
+        require_schema_current(sessions.kw["bind"])
         stop = threading.Event()
         thread = None
         if run_loop:
@@ -140,6 +142,10 @@ def create_app(
         if rollout is None:
             raise HTTPException(404, f"rollout {rollout_id} not found")
         return rollout
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics_endpoint() -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

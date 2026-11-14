@@ -6,13 +6,13 @@ TEST_DB := mysql+pymysql://canary:canary@127.0.0.1:3307/canary_test
 
 .PHONY: help up venv db-up db-down test test-mysql lint fmt run \
         cluster cluster-down images deploy prometheus-forward demo-run \
-        rollout-good rollout-bad rollout-slow status db-reset
+        rollout-good rollout-bad rollout-slow status db-reset migrate migration
 
 help:  ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-20s %s\n", $$1, $$2}'
 
 # --- local dev (no cluster needed) ----------------------------------------
-up: venv db-up  ## Create venv and start MySQL
+up: venv db-up migrate  ## Create venv, start MySQL, apply migrations
 
 venv:  ## Create .venv and install the package + dev tools
 	test -d $(VENV) || python3 -m venv $(VENV)
@@ -24,8 +24,17 @@ db-up:  ## Start MySQL on :3307 and wait until healthy
 db-down:  ## Stop MySQL (keeps data)
 	docker compose down
 
-db-reset:  ## Wipe and recreate the dev database (no migrations yet, so needed after schema changes)
+db-reset:  ## Wipe the dev database and rebuild it from migrations
 	docker compose down -v && docker compose up -d --wait mysql
+	$(MAKE) migrate
+
+migrate:  ## Apply all database migrations
+	$(BIN)/alembic upgrade head
+
+migration:  ## Generate a migration from model changes: make migration m="add foo"
+	@test -n "$(m)" || (echo 'usage: make migration m="what changed"' && exit 1)
+	$(BIN)/alembic revision --autogenerate -m "$(m)"
+	@echo "Review the generated file before committing: autogenerate is a draft, not a decision."
 
 test:  ## Run tests against in-memory SQLite
 	$(BIN)/pytest -q
@@ -39,7 +48,7 @@ lint:  ## Lint + format check
 fmt:  ## Auto-format
 	$(BIN)/ruff check --fix . && $(BIN)/ruff format .
 
-run:  ## Run the API on :8020 with the log-only router (no cluster)
+run: migrate  ## Run the API on :8020 with the log-only router (no cluster)
 	CANARY_ROUTER=log $(BIN)/uvicorn --factory canary.api:create_app --port 8020 --reload
 
 # --- full demo on kind ----------------------------------------------------
@@ -63,7 +72,7 @@ deploy:  ## Apply demo app, load generator and Prometheus
 prometheus-forward:  ## Expose in-cluster Prometheus on :9095 (leave running)
 	kubectl port-forward svc/prometheus 9095:9090
 
-demo-run:  ## Run the controller against the kind cluster
+demo-run: migrate  ## Run the controller against the kind cluster
 	CANARY_ROUTER=kubernetes $(BIN)/uvicorn --factory canary.api:create_app --port 8020
 
 rollout-good:  ## Start a rollout that should succeed, and watch it (~3 min)

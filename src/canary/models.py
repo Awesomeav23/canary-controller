@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, MetaData, String, Text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -17,7 +17,16 @@ def utcnow() -> datetime:
 
 
 class Base(DeclarativeBase):
-    pass
+    # Explicit constraint names, so migrations can refer to them and they are the same
+    # on MySQL and SQLite (otherwise each database invents its own).
+    metadata = MetaData(
+        naming_convention={
+            "ix": "ix_%(column_0_label)s",
+            "uq": "uq_%(table_name)s_%(column_0_name)s",
+            "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+            "pk": "pk_%(table_name)s",
+        }
+    )
 
 
 class RolloutState(StrEnum):
@@ -41,6 +50,9 @@ class Rollout(Base):
     state: Mapped[str] = mapped_column(String(20), default=RolloutState.PENDING, index=True)
     step_index: Mapped[int] = mapped_column(default=-1)
     step_started_at: Mapped[datetime | None] = mapped_column(Timestamp)
+    # When the canary first got traffic (step 0). Rollout duration and time-to-rollback
+    # are measured from here, not from creation, so freeze/queue time doesn't count.
+    started_at: Mapped[datetime | None] = mapped_column(Timestamp)
     # Last stable readings with enough traffic to trust. At the 100% step stable has no
     # pods, so the canary is compared against this instead.
     baseline: Mapped[dict[str, Any] | None] = mapped_column(JSON)

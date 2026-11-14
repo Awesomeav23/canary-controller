@@ -39,11 +39,13 @@ pending / progressing ──(abort API)──> aborted
 | `metrics.py` | PromQL queries for canary error rate and p95 latency |
 | `router.py` | Traffic shifting: replica split between stable and canary Deployments |
 | `api.py` | REST API and the background loop |
+| `telemetry.py` | Prometheus metrics about the controller itself |
+| `db.py`, `migrations/` | Connections, Alembic migrations, startup schema check |
 
 ## Quickstart (no cluster needed)
 
 ```bash
-make up        # venv + MySQL on :3307
+make up        # venv + MySQL on :3307 + migrations
 make test      # unit + API tests (SQLite)
 make test-mysql
 make run       # API on :8020, logs actions instead of touching a cluster
@@ -149,6 +151,66 @@ measure should not be promoted.
 | `POST` | `/rollouts/{id}/abort` | Stop now and roll back |
 | `PUT` / `DELETE` | `/freezes/{app}` | Start or end a deploy freeze (new rollouts wait) |
 | `GET` | `/freezes` | List active freezes |
+| `GET` | `/metrics` | Prometheus metrics about the controller itself (below) |
+
+## Controller metrics
+
+The controller is itself a production service, so it reports on itself at `/metrics`:
+
+| Metric | What it answers |
+|---|---|
+| `canary_rollouts_finished_total{app, outcome}` | How many releases succeed, roll back, or are aborted? |
+| `canary_rollout_duration_seconds{outcome}` | How long rollouts take. `outcome="rolled_back"` is **time to rollback** |
+| `canary_analyses_total{app, result}` | Healthy / unhealthy / waiting-for-traffic checks |
+| `canary_active_rollouts` | Rollouts in flight (updated each tick, so up to 5 s behind) |
+| `canary_advance_errors_total` | Unexpected exceptions. Above 0 means the controller needs attention |
+| `canary_tick_duration_seconds` | How long each loop takes. Rising means the database or Prometheus is slow |
+
+Duration is measured from the canary's **first traffic** (`started_at`), not from when
+the rollout was requested, so time spent waiting on a deploy freeze doesn't count.
+
+Metrics are recorded only **after** the database commit. If the transaction fails, the
+metric doesn't move (`test_failed_transaction_records_nothing`).
+
+Example queries are in `src/canary/telemetry.py`. From a real kind run:
+
+```text
+canary_rollouts_finished_total{app="demo",outcome="rolled_back"} 1.0
+canary_rollouts_finished_total{app="demo",outcome="succeeded"} 1.0
+canary_rollout_duration_seconds_sum{outcome="rolled_back"} 60.40955
+canary_rollout_duration_seconds_sum{outcome="succeeded"} 180.752451
+canary_analyses_total{app="demo",result="healthy"} 3.0
+canary_analyses_total{app="demo",result="unhealthy"} 1.0
+```
+
+## Database migrations
+
+Schema changes ship as Alembic migrations in `src/canary/migrations/versions/`:
+
+| Revision | Change |
+|---|---|
+| `0001` | Initial schema: rollouts, event log, deploy freezes |
+| `0002` | `rollouts.baseline`: last trusted stable readings (Week 3) |
+| `0003` | `rollouts.started_at`, backfilled from each rollout's first `step` event (Week 4) |
+
+```bash
+make migrate                       # apply everything
+make migration m="add foo column"  # draft a new one from model changes, then review it
+```
+
+- **The app checks the schema but never migrates it.** On startup it compares the
+  database's revision with the code's and refuses to start if they differ
+  (`database schema is at 0002, code expects 0003: run make migrate`). Migrating on startup
+  would let several replicas race to run the same migration. In production this would run
+  as a separate deploy step, such as a Kubernetes Job.
+- **Additive changes first.** `0002` and `0003` only add nullable columns, so the old code
+  keeps working while the migration runs. Old and new versions run side by side during a
+  rollout, which this controller of all things should respect.
+- **The schema is checked against the models in CI.** `tests/test_migrations.py` builds
+  the schema from migrations and fails if it differs from the models at all. It also
+  downgrades to nothing and back, and tests the `started_at` backfill.
+- **Tested on MySQL, not just SQLite.** The MySQL CI job caught a downgrade bug SQLite
+  allowed: dropping an index a foreign key still uses (MySQL error 1553).
 
 ## Design decisions and trade-offs
 
@@ -187,8 +249,8 @@ measure should not be promoted.
 - [ ] **Week 2 polish:** Record a GIF of `make rollout-bad` for the top of this README
 - [x] **Week 3:** Compare canary against stable (with a saved baseline for the 100%
       step); wait for a minimum request count before judging; `make rollout-slow` demo
-- [ ] **Week 4:** Alembic migrations; Prometheus metrics for the controller itself
-      (rollouts by outcome, time to rollback)
+- [x] **Week 4:** Alembic migrations (schema checked in CI, startup schema check);
+      Prometheus metrics for the controller itself (outcomes, time to rollback)
 - [ ] **Week 5:** Weighted traffic with Gateway API `HTTPRoute` for finer splits
 - [ ] **Week 6:** Slack/webhook notifications; a GitHub Action that starts a rollout after
       merge
